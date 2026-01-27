@@ -476,7 +476,7 @@ Format: TOOL:LITERATURE_SEARCH|query=brown dwarf atmospheres|max_results=5
 Use for background information on concepts/methods.
 Format: TOOL:RAG_QUERY|query=T dwarf identification
 
-### 5. CODE_EXECUTION - Run Python code
+### 5. CODE_EXECUTION - Run Python code (MUST USE FOR ALL PLOTS)
 Use for calculations, plotting, data analysis, filtering.
 Available: numpy (np), pandas (pd), matplotlib.pyplot (plt), astropy
 Data from CATALOG_QUERY is available as DataFrames: gaia_data, twomass_data, allwise_data, etc.
@@ -484,7 +484,10 @@ Data from CATALOG_QUERY is available as DataFrames: gaia_data, twomass_data, all
 IMPORTANT 2MASS column names: Jmag, Hmag, Kmag (not J, H, K)
 IMPORTANT: Calculate colors like this: twomass_data['Jmag'] - twomass_data['Kmag']
 
-Format: TOOL:CODE_EXECUTION|code=<your python code>
+Format: TOOL:CODE_EXECUTION|code=<your python code on single line>
+
+EXAMPLE - To plot WISE colors, you MUST output exactly:
+TOOL:CODE_EXECUTION|code=import matplotlib.pyplot as plt; w1w2 = allwise_data['W1mag'] - allwise_data['W2mag']; w2w3 = allwise_data['W2mag'] - allwise_data['W3mag']; plt.figure(); plt.scatter(w1w2, w2w3, s=20); plt.xlabel('W1-W2'); plt.ylabel('W2-W3'); plt.title('WISE Colors')
 
 ## CRITICAL RULES
 
@@ -495,9 +498,10 @@ Format: TOOL:CODE_EXECUTION|code=<your python code>
 5. **Chain tools**: lookup → catalog → code for complete analysis
 6. **For clusters**: Use radius=3600 (1 degree) to capture full region
 7. **Color calculations**: J-K = Jmag - Kmag, H-K = Hmag - Kmag
-8. **ALWAYS EXECUTE CODE** - When generating code for plots or analysis, ALWAYS use CODE_EXECUTION tool to run it. NEVER just show code without executing it.
-9. **USE LATEST DATA** - Always use the most recent data from the current conversation. Data from CATALOG_QUERY is available as: gaia_data, twomass_data, allwise_data, catwise_data, simbad_data. Use the data variable that matches the catalog you just queried.
-10. **DONT USE SAMPLE DATA** - Never create sample/fake data. Always use the real data from catalog queries stored in the data variables.
+8. **ALWAYS EXECUTE CODE** - NEVER show code in markdown blocks. ALWAYS use TOOL:CODE_EXECUTION|code=... to run it. If you write ```python, you are doing it WRONG.
+9. **USE LATEST DATA** - Data from CATALOG_QUERY is available as: gaia_data, twomass_data, allwise_data, catwise_data, simbad_data.
+10. **DONT USE SAMPLE DATA** - Never create sample/fake data. Use real data from catalog queries.
+11. **CODE ON SINGLE LINE** - Put all code on one line with semicolons. Do NOT use newlines in code.
 
 ## CODE EXAMPLES FOR COMMON TASKS
 
@@ -585,6 +589,16 @@ def parse_tool_calls(response: str) -> List[Tuple[str, Dict]]:
                 params[key] = value
         
         calls.append((tool_name.upper(), params))
+    
+    # Fallback: If no tool calls found but there's a code block with plotting, auto-execute it
+    if not calls and ('```python' in response or '```' in response):
+        code_pattern = r'```(?:python)?\n(.*?)```'
+        code_matches = re.findall(code_pattern, response, re.DOTALL)
+        if code_matches:
+            # Check if code looks like it should produce a plot
+            code = code_matches[0]
+            if 'plt.' in code or 'scatter' in code or 'plot' in code:
+                calls.append(('CODE_EXECUTION', {'code': code}))
     
     return calls
 
