@@ -488,6 +488,9 @@ Format: TOOL:CODE_EXECUTION|code=<your python code>
 5. **Chain tools**: lookup → catalog → code for complete analysis
 6. **For clusters**: Use radius=3600 (1 degree) to capture full region
 7. **Color calculations**: J-K = Jmag - Kmag, H-K = Hmag - Kmag
+8. **ALWAYS EXECUTE CODE** - When generating code for plots or analysis, ALWAYS use CODE_EXECUTION tool to run it. NEVER just show code without executing it.
+9. **USE LATEST DATA** - Always use the most recent data from the current conversation. Data from CATALOG_QUERY is available as: gaia_data, twomass_data, allwise_data, catwise_data, simbad_data. Use the data variable that matches the catalog you just queried.
+10. **DONT USE SAMPLE DATA** - Never create sample/fake data. Always use the real data from catalog queries stored in the data variables.
 
 ## CODE EXAMPLES FOR COMMON TASKS
 
@@ -499,6 +502,16 @@ plt.scatter(hk, jk, s=5, alpha=0.5)
 red = jk > 1.0
 plt.scatter(hk[red], jk[red], c='red', s=20, label='J-K > 1')
 plt.xlabel('H-K'); plt.ylabel('J-K'); plt.legend(); plt.title('Color-Color Diagram')
+```
+
+WISE Color-Color diagram:
+```python
+w1w2 = allwise_data['W1mag'] - allwise_data['W2mag']
+w2w3 = allwise_data['W2mag'] - allwise_data['W3mag']
+plt.scatter(w1w2, w2w3, s=20, alpha=0.7)
+plt.xlabel('W1-W2'); plt.ylabel('W2-W3'); plt.title('WISE Color-Color Diagram')
+plt.axvline(x=0.8, color='r', linestyle='--', label='T dwarf cut')
+plt.legend()
 ```
 
 CMD with Gaia:
@@ -583,7 +596,10 @@ def execute_tool(tool_name: str, params: Dict, state: AgentState) -> str:
         state.tool_results.append({"tool": tool_name, "result": result})
         
         if result.get("data") or result.get("full_data") is not None:
-            catalog_name = params.get('catalog', 'data').lower().replace('2mass', 'twomass')
+            catalog_name = params.get('catalog', 'data').lower()
+            # Fix: Python variable names can't start with numbers
+            if catalog_name == '2mass':
+                catalog_name = 'twomass'
             if 'full_data' in result:
                 state.data_context[f"{catalog_name}_data"] = result['full_data']
             else:
