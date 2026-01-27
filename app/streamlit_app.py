@@ -9,8 +9,6 @@ Every user query goes through the agent loop where the model decides:
 - When to execute code (calculations, plots requested)
 - When to search literature (research questions)
 - When to just respond directly (simple questions)
-
-The model sees tool results and incorporates them into its response.
 """
 
 import os
@@ -53,26 +51,11 @@ st.markdown("""
     .tool-code { background-color: #e8f5e9; color: #2e7d32; }
     .tool-literature { background-color: #fff3e0; color: #ef6c00; }
     .tool-lookup { background-color: #fce4ec; color: #c2185b; }
-    .thinking-box {
-        background-color: #f5f5f5;
-        border-left: 3px solid #9e9e9e;
+    .error-box {
+        background-color: #ffebee;
+        border-left: 3px solid #c62828;
         padding: 10px;
         margin: 10px 0;
-        font-size: 0.85rem;
-        color: #616161;
-    }
-    .source-chip {
-        display: inline-block;
-        background-color: #e0e0e0;
-        padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.75rem;
-        margin: 2px;
-    }
-    .data-table {
-        font-size: 0.85rem;
-        max-height: 300px;
-        overflow-y: auto;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -226,14 +209,13 @@ class AstroTools:
             else:
                 return {"error": f"Unknown catalog: {catalog}", "data": []}
             
-            # Convert to list of dicts for JSON serialization
             if len(df) > 0:
                 return {
                     "catalog": catalog.upper(),
                     "total_found": len(df),
                     "data": df.head(20).to_dict(orient="records"),
                     "columns": list(df.columns),
-                    "full_data": df,  # Keep full DataFrame for code execution
+                    "full_data": df,
                     "ra": ra, "dec": dec, "radius": radius
                 }
             else:
@@ -250,11 +232,9 @@ class AstroTools:
             from astropy.coordinates import SkyCoord
             from astroquery.simbad import Simbad
             
-            # Resolve coordinates
             coord = SkyCoord.from_name(name)
             ra, dec = coord.ra.degree, coord.dec.degree
             
-            # Get SIMBAD info
             simbad = Simbad()
             simbad.add_votable_fields('otype', 'sptype', 'plx', 'pm', 
                                       'flux(V)', 'flux(J)', 'flux(K)')
@@ -319,7 +299,6 @@ class AstroTools:
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         
-        # Set up namespace with pre-loaded libraries
         namespace = {}
         setup = """
 import numpy as np
@@ -335,7 +314,6 @@ plt.rcParams['figure.dpi'] = 100
 """
         exec(setup, namespace)
         
-        # Inject data from previous tool calls
         if data_context:
             for name, data in data_context.items():
                 if isinstance(data, pd.DataFrame):
@@ -351,7 +329,6 @@ plt.rcParams['figure.dpi'] = 100
             with contextlib.redirect_stdout(stdout_capture):
                 exec(code, namespace)
             
-            # Capture plots
             for fig_num in plt.get_fignums():
                 fig = plt.figure(fig_num)
                 buf = io.BytesIO()
@@ -414,26 +391,17 @@ Format: TOOL:CODE_EXECUTION|code=plt.scatter(gaia_data['bp_rp'], gaia_data['phot
 When using tools, output EXACTLY:
 TOOL:TOOL_NAME|param1=value1|param2=value2
 
-After tool results come back, either:
-- Use more tools if needed
-- Provide final answer with insights from the data
+After tool results come back, either use more tools if needed, or provide your final answer WITHOUT tool tags.
 
 ## EXAMPLES
 
 User: "Tell me about 2MASS J0559-1404"
 → TOOL:OBJECT_LOOKUP|name=2MASS J0559-1404
 → (get coords) TOOL:CATALOG_QUERY|catalog=gaia|ra=<ra>|dec=<dec>|radius=10
-→ TOOL:CATALOG_QUERY|catalog=2mass|ra=<ra>|dec=<dec>|radius=10
-→ Synthesize info into response
 
 User: "Plot CMD for sources at RA=180, Dec=45"
 → TOOL:CATALOG_QUERY|catalog=gaia|ra=180|dec=45|radius=60
 → TOOL:CODE_EXECUTION|code=plt.scatter(gaia_data['bp_rp'], gaia_data['phot_g_mean_mag']); plt.gca().invert_yaxis(); plt.xlabel('BP-RP'); plt.ylabel('G mag'); plt.title('CMD')
-
-User: "What colors identify T dwarfs?"
-→ TOOL:RAG_QUERY|query=T dwarf color identification criteria
-→ TOOL:LITERATURE_SEARCH|query=T dwarf photometric classification
-→ Provide answer with citations
 
 Remember: Your value comes from providing REAL DATA from catalogs, not generic information."""
 
@@ -464,7 +432,6 @@ def parse_tool_calls(response: str) -> List[Tuple[str, Dict]]:
                 key = key.strip()
                 value = value.strip()
                 
-                # Type conversion
                 if key in ['ra', 'dec', 'radius']:
                     try:
                         value = float(value)
@@ -497,7 +464,6 @@ def execute_tool(tool_name: str, params: Dict, state: AgentState) -> str:
         state.tool_results.append({"tool": tool_name, "result": result})
         
         if result.get("data") or result.get("full_data") is not None:
-            # Store data for code execution
             catalog_name = params.get('catalog', 'data').lower()
             if 'full_data' in result:
                 state.data_context[f"{catalog_name}_data"] = result['full_data']
@@ -522,7 +488,6 @@ Sample (first 5 rows):
         state.tool_results.append({"tool": tool_name, "result": result})
         
         if result.get("resolved"):
-            # Store coordinates for subsequent catalog queries
             state.data_context["last_ra"] = result.get("ra")
             state.data_context["last_dec"] = result.get("dec")
             
@@ -598,32 +563,41 @@ You can now query catalogs at these coordinates."""
 
 
 def call_astrollama(messages: List[Dict], client) -> str:
-    """Call AstroLlama model on Bedrock"""
+    """Call AstroLlama model on Bedrock using Llama format"""
     secrets = get_secrets()
-    model_id = secrets.get("ASTROLLAMA_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
+    model_id = secrets.get("ASTROLLAMA_MODEL_ID")
     
+    if not model_id:
+        return "Error: ASTROLLAMA_MODEL_ID not configured in secrets"
+    
+    # Build prompt in Llama 3 format
+    prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{AGENT_SYSTEM_PROMPT}<|eot_id|>"
+    
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        prompt += f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
+    
+    prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    
+    # Llama model request body
     body = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 4096,
-        "system": AGENT_SYSTEM_PROMPT,
-        "messages": messages
+        "prompt": prompt,
+        "max_gen_len": 2048,
+        "temperature": 0.7,
+        "top_p": 0.9
     }
     
     try:
-        response = client.invoke_model(modelId=model_id, body=json.dumps(body))
+        response = client.invoke_model(
+            modelId=model_id,
+            body=json.dumps(body)
+        )
         result = json.loads(response["body"].read())
-        return result["content"][0]["text"]
+        return result.get("generation", "")
     except Exception as e:
-        # Fallback to Claude
-        try:
-            response = client.invoke_model(
-                modelId="anthropic.claude-3-sonnet-20240229-v1:0",
-                body=json.dumps(body)
-            )
-            result = json.loads(response["body"].read())
-            return result["content"][0]["text"]
-        except Exception as e2:
-            return f"Error calling model: {e2}"
+        error_msg = str(e)
+        return f"Error calling AstroLlama model: {error_msg}"
 
 
 def run_agent(user_query: str, client, progress_callback=None, max_iterations: int = 6) -> Tuple[str, AgentState]:
@@ -635,17 +609,17 @@ def run_agent(user_query: str, client, progress_callback=None, max_iterations: i
         if progress_callback:
             progress_callback(f"Step {iteration + 1}: Analyzing...")
         
-        # Get model response
         response = call_astrollama(messages, client)
         
-        # Parse tool calls
+        # Check for errors
+        if response.startswith("Error"):
+            return response, state
+        
         tool_calls = parse_tool_calls(response)
         
         if not tool_calls:
-            # No tool calls - this is the final answer
             return response, state
         
-        # Execute tools
         tool_results_text = []
         for tool_name, params in tool_calls:
             if progress_callback:
@@ -654,7 +628,6 @@ def run_agent(user_query: str, client, progress_callback=None, max_iterations: i
             result_text = execute_tool(tool_name, params, state)
             tool_results_text.append(result_text)
         
-        # Add to conversation
         messages.append({"role": "assistant", "content": response})
         messages.append({
             "role": "user",
@@ -669,7 +642,6 @@ Based on these results, continue your analysis.
 - Remember to reference specific values from the data."""
         })
     
-    # Max iterations reached - ask for final answer
     messages.append({
         "role": "user", 
         "content": "Please provide your final answer now based on all the information gathered."
@@ -689,12 +661,12 @@ def render_sidebar():
         
         st.divider()
         
-        # System status
         st.markdown("### System Status")
         secrets = get_secrets()
         
         statuses = [
             ("AWS Bedrock", bool(secrets.get("AWS_ACCESS_KEY_ID"))),
+            ("AstroLlama Model", bool(secrets.get("ASTROLLAMA_MODEL_ID"))),
             ("RAG Knowledge Base", bool(secrets.get("PINECONE_API_KEY"))),
             ("NASA ADS", bool(secrets.get("ADS_TOKEN")))
         ]
@@ -705,7 +677,6 @@ def render_sidebar():
         
         st.divider()
         
-        # Available tools info
         st.markdown("### 🛠️ Available Tools")
         st.caption("The agent automatically uses these based on your query:")
         tools_info = [
@@ -720,7 +691,6 @@ def render_sidebar():
         
         st.divider()
         
-        # Clear chat
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.messages = []
             st.session_state.agent_states = []
@@ -728,7 +698,6 @@ def render_sidebar():
         
         st.divider()
         
-        # Example queries
         st.markdown("### 💡 Try These")
         examples = [
             "What do we know about TRAPPIST-1?",
@@ -769,24 +738,29 @@ def render_tool_badges(tools_used: List[str]):
 
 def main():
     """Main application"""
-    # Initialize session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "agent_states" not in st.session_state:
         st.session_state.agent_states = []
     
-    # Render sidebar
     render_sidebar()
     
-    # Header
     st.markdown('<p class="main-header">🦙 AstroLlama</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">Ask me anything about astronomy — I\'ll search catalogs, find papers, and create plots automatically.</p>', unsafe_allow_html=True)
     
-    # Initialize client
     client = init_bedrock_client()
     if client is None:
         st.error("Could not connect to AWS Bedrock. Check your credentials.")
         return
+    
+    # Check if model ID is configured
+    secrets = get_secrets()
+    if not secrets.get("ASTROLLAMA_MODEL_ID"):
+        st.warning("⚠️ ASTROLLAMA_MODEL_ID not configured. Please add it to your Streamlit secrets.")
+        st.code("""
+# Add to .streamlit/secrets.toml or Streamlit Cloud secrets:
+ASTROLLAMA_MODEL_ID = "arn:aws:bedrock:us-west-2:917791789035:custom-model-deployment/df4go8aqk6ix"
+        """)
     
     st.divider()
     
@@ -795,42 +769,38 @@ def main():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             
-            # Show extras for assistant messages
             if message["role"] == "assistant" and i // 2 < len(st.session_state.agent_states):
                 state = st.session_state.agent_states[i // 2]
                 
                 render_tool_badges(state.tools_used)
                 
-                # Show plots
-                for j, plot_b64 in enumerate(state.plots):
+                for plot_b64 in state.plots:
                     st.image(f"data:image/png;base64,{plot_b64}")
                 
-                # Expandable sections
                 col1, col2 = st.columns(2)
                 
                 with col1:
                     if state.sources:
-                        with st.expander(f"📚 Sources ({len(state.sources)})"):
+                        with st.expander(f"📚 Sources ({len(set(state.sources))})"):
                             for src in list(set(state.sources))[:5]:
                                 st.markdown(f"[{src}](https://ui.adsabs.harvard.edu/abs/{src})")
                 
                 with col2:
-                    if state.data_context:
-                        data_items = [(k, v) for k, v in state.data_context.items() 
-                                     if isinstance(v, pd.DataFrame)]
-                        if data_items:
-                            with st.expander(f"📊 Data ({len(data_items)} tables)"):
-                                for name, df in data_items:
-                                    st.markdown(f"**{name}**: {len(df)} rows")
-                                    st.dataframe(df.head(5), use_container_width=True)
-                                    st.download_button(
-                                        f"Download {name}",
-                                        df.to_csv(index=False),
-                                        f"{name}.csv",
-                                        key=f"dl_{name}_{i}"
-                                    )
+                    data_items = [(k, v) for k, v in state.data_context.items() 
+                                 if isinstance(v, pd.DataFrame)]
+                    if data_items:
+                        with st.expander(f"📊 Data ({len(data_items)} tables)"):
+                            for name, df in data_items:
+                                st.markdown(f"**{name}**: {len(df)} rows")
+                                st.dataframe(df.head(5), use_container_width=True)
+                                st.download_button(
+                                    f"Download {name}",
+                                    df.to_csv(index=False),
+                                    f"{name}.csv",
+                                    key=f"dl_{name}_{i}"
+                                )
     
-    # Handle pending query from sidebar
+    # Handle pending query
     if "pending_query" in st.session_state:
         prompt = st.session_state.pending_query
         del st.session_state.pending_query
@@ -839,13 +809,11 @@ def main():
     
     # Process new query
     if prompt:
-        # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Run agent
         with st.chat_message("assistant"):
             status = st.empty()
             
@@ -858,14 +826,17 @@ def main():
             
             status.empty()
             
-            st.markdown(response)
+            # Check for errors
+            if response.startswith("Error"):
+                st.markdown(f'<div class="error-box">{response}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(response)
+            
             render_tool_badges(state.tools_used)
             
-            # Show plots
             for plot_b64 in state.plots:
                 st.image(f"data:image/png;base64,{plot_b64}")
             
-            # Show sources and data
             col1, col2 = st.columns(2)
             
             with col1:
@@ -889,7 +860,6 @@ def main():
                                 key=f"dl_{name}_new"
                             )
         
-        # Save state
         st.session_state.messages.append({"role": "assistant", "content": response})
         st.session_state.agent_states.append(state)
         
