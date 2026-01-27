@@ -1,0 +1,168 @@
+# AstroLlama Configuration
+# Copy to config.yaml and fill in your API keys
+
+# =============================================================================
+# AWS Bedrock Configuration (RECOMMENDED)
+# =============================================================================
+aws_bedrock:
+  region: "us-west-2"  # Required for Llama fine-tuning
+  
+  # Fine-tunable model IDs (use :128k suffix versions)
+  # Choose one based on your needs:
+  models:
+    # Recommended - best quality
+    primary: "meta.llama3-3-70b-instruct-v1:0:128k"
+    
+    # Alternative options:
+    llama_3_3_70b: "meta.llama3-3-70b-instruct-v1:0:128k"
+    llama_3_1_70b: "meta.llama3-1-70b-instruct-v1:0:128k"
+    llama_3_1_8b: "meta.llama3-1-8b-instruct-v1:0:128k"      # Cheaper for testing
+    llama_3_2_11b: "meta.llama3-2-11b-instruct-v1:0:128k"    # Multimodal
+    llama_3_2_90b: "meta.llama3-2-90b-instruct-v1:0:128k"    # Multimodal
+  
+  # S3 bucket for training data (created by aws_setup.sh)
+  s3_bucket: "${ASTROLLAMA_BUCKET}"
+  
+  # IAM role for fine-tuning (created by aws_setup.sh)
+  customization_role: "${BEDROCK_CUSTOMIZATION_ROLE}"
+  
+  # Agent role (created by aws_setup.sh)
+  agent_role: "${BEDROCK_AGENT_ROLE}"
+
+# =============================================================================
+# LLM Configuration (Alternative: Together.ai/Fireworks)
+# =============================================================================
+llm:
+  # Choose your provider: "together", "fireworks", "local"
+  provider: "together"
+  
+  # Together.ai settings
+  together:
+    api_key: "${TOGETHER_API_KEY}"
+    # Use your fine-tuned model ID after training, or base model for testing
+    model: "meta-llama/Llama-3.1-70B-Instruct"
+    # After fine-tuning, replace with: "your-username/astro-llama-70b"
+    max_tokens: 4096
+    temperature: 0.1  # Low temp for factual astronomy
+    
+  # Fireworks.ai settings (alternative)
+  fireworks:
+    api_key: "${FIREWORKS_API_KEY}"
+    model: "accounts/fireworks/models/llama-v3p1-70b-instruct"
+    
+  # Local deployment (vLLM/TGI)
+  local:
+    base_url: "http://localhost:8000/v1"
+    model: "meta-llama/Llama-3.1-70B-Instruct"
+
+# =============================================================================
+# RAG Configuration (Pinecone - FREE tier available)
+# =============================================================================
+rag:
+  # Embedding model
+  embeddings:
+    model: "BAAI/bge-large-en-v1.5"
+    dimension: 1024
+    device: "cuda"  # or "cpu"
+    
+  # Vector store - Pinecone (FREE tier: 100K vectors)
+  vectorstore:
+    provider: "pinecone"
+    
+    pinecone:
+      api_key: "${PINECONE_API_KEY}"  # Or get from AWS Secrets Manager
+      index_name: "astrollama-knowledge"
+      # Create index at: https://www.pinecone.io/
+      # Settings: 1024 dimensions, cosine metric, AWS us-west-2
+      
+    # Alternative: Local ChromaDB (no setup required)
+    chroma:
+      persist_directory: "./data/chroma_db"
+      
+  # Retrieval settings
+  retriever:
+    top_k: 5
+    score_threshold: 0.7
+
+# =============================================================================
+# External API Keys (Astronomy Services)
+# =============================================================================
+astronomy_apis:
+  # NASA ADS - Get from: https://ui.adsabs.harvard.edu/user/settings/token
+  ads_token: "${ADS_DEV_KEY}"
+  
+  # MAST (STScI) - Optional, for authenticated access
+  mast_token: "${MAST_API_TOKEN}"
+  
+  # ESA archives - Usually no auth needed for public data
+  
+# =============================================================================
+# Agent Configuration
+# =============================================================================
+agents:
+  # Maximum iterations for agent loops
+  max_iterations: 15
+  
+  # Tools to enable
+  enabled_tools:
+    - "catalog_query"
+    - "crossmatch"
+    - "plot_cmd"
+    - "plot_sed"
+    - "plot_lightcurve"
+    - "search_ads"
+    - "search_arxiv"
+    - "generate_citation"
+    - "reduce_image"
+    - "extract_sources"
+    - "apply_color_cut"
+    
+  # Output directory for plots/files
+  output_dir: "./outputs"
+
+# =============================================================================
+# Fine-tuning Configuration
+# =============================================================================
+finetuning:
+  # Base model
+  base_model: "meta-llama/Llama-3.1-70B-Instruct"
+  
+  # Training data
+  train_data: "./data/training/combined_train.jsonl"
+  val_data: "./data/training/combined_val.jsonl"
+  
+  # LoRA/QLoRA settings
+  lora:
+    r: 64
+    lora_alpha: 128
+    lora_dropout: 0.05
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+      - "gate_proj"
+      - "up_proj"
+      - "down_proj"
+      
+  # Training hyperparameters
+  training:
+    num_epochs: 3
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    learning_rate: 2e-4
+    warmup_ratio: 0.03
+    max_seq_length: 4096
+    
+  # Quantization for QLoRA
+  quantization:
+    load_in_4bit: true
+    bnb_4bit_compute_dtype: "bfloat16"
+    bnb_4bit_quant_type: "nf4"
+
+# =============================================================================
+# Logging
+# =============================================================================
+logging:
+  level: "INFO"
+  file: "./logs/astro_assistant.log"

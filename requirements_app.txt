@@ -1,0 +1,29 @@
+# AstroLlama - Requirements for Web UI and Agents
+# Install: pip install -r requirements.txt
+
+# Web UI
+streamlit>=1.30.0
+
+# AWS SDK
+boto3>=1.34.0
+botocore>=1.34.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Astronomy tools (optional - for full functionality)
+# astropy>=6.0.0
+# astroquery>=0.4.6
+
+# RAG / Embeddings
+pinecone-client>=3.0.0
+sentence-transformers>=2.2.0
+
+# API server (optional)
+fastapi>=0.109.0
+uvicorn>=0.27.0
+
+# Utilities
+python-dotenv>=1.0.0
+requests>=2.31.0
