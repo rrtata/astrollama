@@ -61,6 +61,85 @@ def check_configuration() -> tuple[bool, List[str]]:
 
 
 # =============================================================================
+# RAG Functions (must be before invoke_astrollama)
+# =============================================================================
+
+@st.cache_resource
+def get_rag_client():
+    """Initialize RAG client with Pinecone."""
+    try:
+        from pinecone import Pinecone
+        from sentence_transformers import SentenceTransformer
+        
+        # Get API key
+        api_key = os.environ.get("PINECONE_API_KEY", "")
+        
+        if not api_key:
+            # Try AWS Secrets Manager
+            try:
+                import boto3
+                client = boto3.client("secretsmanager", region_name="us-west-2")
+                response = client.get_secret_value(SecretId="astrollama/api-keys")
+                secrets = json.loads(response["SecretString"])
+                api_key = secrets.get("PINECONE_API_KEY", "")
+            except:
+                pass
+        
+        if not api_key:
+            return None, None
+        
+        pc = Pinecone(api_key=api_key)
+        index = pc.Index("astrollama-rag")
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        
+        return index, model
+    
+    except Exception as e:
+        return None, None
+
+
+def rag_search(query: str, top_k: int = 5, filter_source: str = "All") -> list:
+    """Search RAG index."""
+    index, model = get_rag_client()
+    
+    if index is None or model is None:
+        return []
+    
+    try:
+        # Generate query embedding
+        query_embedding = model.encode([query])[0].tolist()
+        
+        # Build filter
+        filter_dict = None
+        if filter_source == "ADS Papers":
+            filter_dict = {"source": {"$eq": "ads"}}
+        elif filter_source == "Documentation":
+            filter_dict = {"source": {"$eq": "documentation"}}
+        
+        # Query Pinecone
+        results = index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True,
+            filter=filter_dict
+        )
+        
+        # Format results
+        formatted = []
+        for match in results.matches:
+            formatted.append({
+                "score": match.score,
+                "text": match.metadata.get("text", ""),
+                "metadata": {k: v for k, v in match.metadata.items() if k != "text"}
+            })
+        
+        return formatted
+    
+    except Exception as e:
+        return []
+
+
+# =============================================================================
 # Bedrock Client
 # =============================================================================
 
@@ -75,11 +154,33 @@ def get_bedrock_client():
         return None
 
 
-def invoke_astrollama(prompt: str, system_prompt: str = None, max_tokens: int = 2048) -> str:
-    """Invoke the AstroLlama model."""
+def invoke_astrollama(prompt: str, system_prompt: str = None, max_tokens: int = 2048, use_rag: bool = True) -> str:
+    """Invoke the AstroLlama model with optional RAG enhancement."""
     client = get_bedrock_client()
     if not client:
         return "Error: Bedrock client not available"
+    
+    # RAG: Search for relevant context first
+    rag_context = ""
+    rag_sources = []
+    
+    if use_rag:
+        try:
+            results = rag_search(prompt, top_k=3)
+            if results:
+                context_texts = []
+                for r in results:
+                    context_texts.append(r.get("text", ""))
+                    # Track sources
+                    meta = r.get("metadata", {})
+                    if meta.get("title"):
+                        rag_sources.append(f"- {meta.get('title', '')[:60]}...")
+                    elif meta.get("survey"):
+                        rag_sources.append(f"- {meta.get('survey')} documentation")
+                
+                rag_context = "\n\n".join(context_texts)
+        except:
+            pass  # Continue without RAG if it fails
     
     # Default system prompt
     if not system_prompt:
@@ -92,12 +193,24 @@ def invoke_astrollama(prompt: str, system_prompt: str = None, max_tokens: int = 
 
 Provide accurate, practical advice with code examples when appropriate."""
     
+    # Add RAG context to prompt if available
+    if rag_context:
+        enhanced_prompt = f"""I found the following relevant information from astronomy papers and documentation:
+
+---
+{rag_context}
+---
+
+Based on this context and your knowledge, please answer: {prompt}"""
+    else:
+        enhanced_prompt = prompt
+    
     # Format prompt for Llama
     formatted_prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 {system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
 
-{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+{enhanced_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
     
@@ -118,7 +231,13 @@ Provide accurate, practical advice with code examples when appropriate."""
         )
         
         result = json.loads(response["body"].read())
-        return result.get("generation", "No response generated")
+        answer = result.get("generation", "No response generated")
+        
+        # Append sources if RAG was used
+        if rag_sources:
+            answer += "\n\n---\n📚 **Sources used:**\n" + "\n".join(rag_sources[:3])
+        
+        return answer
         
     except Exception as e:
         return f"Error invoking model: {str(e)}"
@@ -193,6 +312,7 @@ def render_sidebar():
         with st.expander("⚙️ Settings"):
             st.number_input("Max tokens", min_value=256, max_value=4096, value=1024, key="max_tokens")
             st.slider("Temperature", 0.0, 1.0, 0.7, key="temperature")
+            st.checkbox("📚 Use RAG (search papers first)", value=True, key="use_rag")
         
         # Status
         st.divider()
@@ -229,8 +349,9 @@ def render_chat_mode():
         
         # Generate response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                response = invoke_astrollama(prompt, max_tokens=st.session_state.get("max_tokens", 1024))
+            with st.spinner("Searching papers & thinking..."):
+                use_rag = st.session_state.get("use_rag", True)
+                response = invoke_astrollama(prompt, max_tokens=st.session_state.get("max_tokens", 1024), use_rag=use_rag)
             st.markdown(response)
         
         # Add assistant message
@@ -399,43 +520,34 @@ WHERE parallax > 10""")
 
 
 def render_rag_mode():
-    """Render the RAG search interface."""
+    """Render the RAG search interface for direct document search."""
     
-    st.header("📚 RAG Document Search")
-    st.caption("Search through ingested astronomy papers and documentation.")
+    st.header("📚 Document Search")
+    st.caption("Search through 957 astronomy papers and documentation directly.")
+    st.info("💡 RAG is now integrated into Chat! Questions automatically search relevant papers first.")
     
     # Search input
-    query = st.text_input("Search query", placeholder="e.g., T dwarf WISE color selection")
+    query = st.text_input("Search documents", placeholder="e.g., T dwarf WISE color selection")
     
     col1, col2 = st.columns([1, 4])
     with col1:
-        top_k = st.selectbox("Results", [3, 5, 10, 20], index=1)
+        top_k = st.selectbox("Results", [5, 10, 20, 50], index=1)
     with col2:
-        filter_source = st.selectbox("Filter by source", ["All", "ADS Papers", "Documentation"])
+        filter_source = st.selectbox("Filter", ["All", "ADS Papers", "Documentation"])
     
-    use_llm = st.checkbox("Generate answer with AstroLlama", value=True)
-    
-    if st.button("🔍 Search", type="primary"):
+    if st.button("🔍 Search Documents", type="primary"):
         if not query:
             st.warning("Please enter a search query")
             return
         
-        with st.spinner("Searching documents..."):
+        with st.spinner("Searching..."):
             results = rag_search(query, top_k=top_k, filter_source=filter_source)
         
-        if results is None:
-            st.error("RAG not configured. Check Pinecone API key.")
-            return
-        
         if not results:
-            st.info("No results found. Try a different query.")
+            st.info("No results found.")
             return
         
-        # Display results
-        st.subheader(f"Found {len(results)} relevant documents")
-        
-        # Collect context for LLM
-        context_texts = []
+        st.subheader(f"Found {len(results)} documents")
         
         for i, result in enumerate(results):
             score = result.get("score", 0)
@@ -443,9 +555,6 @@ def render_rag_mode():
             metadata = result.get("metadata", {})
             source = metadata.get("source", "unknown")
             
-            context_texts.append(text)
-            
-            # Display each result
             with st.expander(f"📄 Result {i+1} (Score: {score:.3f}) - {source}"):
                 if metadata.get("title"):
                     st.markdown(f"**Title:** {metadata['title']}")
@@ -455,132 +564,8 @@ def render_rag_mode():
                     st.markdown(f"**Year:** {metadata['year']}")
                 if metadata.get("survey"):
                     st.markdown(f"**Survey:** {metadata['survey']}")
-                
                 st.markdown("---")
                 st.markdown(text)
-        
-        # Generate LLM answer using retrieved context
-        if use_llm and context_texts:
-            st.subheader("🦙 AstroLlama's Answer")
-            
-            context = "\n\n---\n\n".join(context_texts[:5])  # Top 5 for context
-            
-            rag_prompt = f"""Based on the following retrieved documents, answer the question.
-
-RETRIEVED DOCUMENTS:
-{context}
-
-QUESTION: {query}
-
-Provide a comprehensive answer based on the documents above. Cite specific information from the documents when relevant."""
-            
-            with st.spinner("Generating answer..."):
-                answer = invoke_astrollama(rag_prompt, max_tokens=1024)
-            
-            st.markdown(answer)
-    
-    # Quick searches
-    st.divider()
-    st.subheader("Quick Searches")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if st.button("T dwarf WISE colors"):
-            st.session_state.rag_query = "T dwarf WISE color selection W1-W2"
-            st.rerun()
-    
-    with col2:
-        if st.button("Brown dwarf spectral indices"):
-            st.session_state.rag_query = "spectral indices L dwarf T dwarf classification"
-            st.rerun()
-    
-    with col3:
-        if st.button("Gaia brown dwarf selection"):
-            st.session_state.rag_query = "Gaia brown dwarf candidate selection criteria"
-            st.rerun()
-
-
-# =============================================================================
-# RAG Functions
-# =============================================================================
-
-@st.cache_resource
-def get_rag_client():
-    """Initialize RAG client with Pinecone."""
-    try:
-        from pinecone import Pinecone
-        from sentence_transformers import SentenceTransformer
-        
-        # Get API key
-        api_key = os.environ.get("PINECONE_API_KEY", "")
-        
-        if not api_key:
-            # Try AWS Secrets Manager
-            try:
-                import boto3
-                client = boto3.client("secretsmanager", region_name="us-west-2")
-                response = client.get_secret_value(SecretId="astrollama/api-keys")
-                import json
-                secrets = json.loads(response["SecretString"])
-                api_key = secrets.get("PINECONE_API_KEY", "")
-            except:
-                pass
-        
-        if not api_key:
-            return None, None
-        
-        pc = Pinecone(api_key=api_key)
-        index = pc.Index("astrollama-rag")
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        return index, model
-    
-    except Exception as e:
-        st.error(f"RAG init error: {e}")
-        return None, None
-
-
-def rag_search(query: str, top_k: int = 5, filter_source: str = "All") -> list:
-    """Search RAG index."""
-    index, model = get_rag_client()
-    
-    if index is None or model is None:
-        return None
-    
-    try:
-        # Generate query embedding
-        query_embedding = model.encode([query])[0].tolist()
-        
-        # Build filter
-        filter_dict = None
-        if filter_source == "ADS Papers":
-            filter_dict = {"source": {"$eq": "ads"}}
-        elif filter_source == "Documentation":
-            filter_dict = {"source": {"$eq": "documentation"}}
-        
-        # Query Pinecone
-        results = index.query(
-            vector=query_embedding,
-            top_k=top_k,
-            include_metadata=True,
-            filter=filter_dict
-        )
-        
-        # Format results
-        formatted = []
-        for match in results.matches:
-            formatted.append({
-                "score": match.score,
-                "text": match.metadata.get("text", ""),
-                "metadata": {k: v for k, v in match.metadata.items() if k != "text"}
-            })
-        
-        return formatted
-    
-    except Exception as e:
-        st.error(f"RAG search error: {e}")
-        return []
 
 
 # =============================================================================
