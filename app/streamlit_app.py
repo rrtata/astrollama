@@ -719,54 +719,102 @@ You can now query catalogs at these coordinates."""
 
 
 def call_astrollama(messages: List[Dict], client, max_retries: int = 5) -> str:
-    """Call AstroLlama model on Bedrock using Llama format with retry logic"""
+    """Call AstroLlama or Claude model on Bedrock with retry logic"""
     secrets = get_secrets()
-    model_id = secrets.get("ASTROLLAMA_MODEL_ID")
     
-    if not model_id:
-        return "Error: ASTROLLAMA_MODEL_ID not configured in secrets"
+    # Check which model is selected
+    use_claude = st.session_state.get("model_choice", "AstroLlama (Fine-tuned)") == "Claude 4.5 Sonnet"
     
-    # Build prompt in Llama 3 format
-    prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{AGENT_SYSTEM_PROMPT}<|eot_id|>"
-    
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-        prompt += f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
-    
-    prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
-    
-    # Llama model request body
-    body = {
-        "prompt": prompt,
-        "max_gen_len": 2048,
-        "temperature": 0.7,
-        "top_p": 0.9
-    }
-    
-    # Retry with exponential backoff for throttling
-    for attempt in range(max_retries):
-        try:
-            response = client.invoke_model(
-                modelId=model_id,
-                body=json.dumps(body)
-            )
-            result = json.loads(response["body"].read())
-            return result.get("generation", "")
-        except Exception as e:
-            error_msg = str(e)
-            
-            # Check if it's a throttling error
-            if "ThrottlingException" in error_msg or "Too many requests" in error_msg:
-                if attempt < max_retries - 1:
-                    # Exponential backoff: 2, 4, 8, 16, 32 seconds
-                    wait_time = 2 ** (attempt + 1)
-                    time.sleep(wait_time)
-                    continue
+    if use_claude:
+        # Use Claude 4.5 Sonnet
+        model_id = "anthropic.claude-sonnet-4-20250514"
+        
+        # Build messages for Claude format
+        claude_messages = []
+        for msg in messages:
+            claude_messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+        
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 4096,
+            "system": AGENT_SYSTEM_PROMPT,
+            "messages": claude_messages
+        }
+        
+        for attempt in range(max_retries):
+            try:
+                response = client.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps(body)
+                )
+                result = json.loads(response["body"].read())
+                # Claude returns content as a list
+                content = result.get("content", [])
+                if content and isinstance(content, list):
+                    return content[0].get("text", "")
+                return ""
+            except Exception as e:
+                error_msg = str(e)
+                if "ThrottlingException" in error_msg or "Too many requests" in error_msg:
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** (attempt + 1)
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return f"Error: Model rate limited. Please wait a minute and try again."
                 else:
-                    return f"Error: Model rate limited. Please wait a minute and try again."
-            else:
-                return f"Error calling AstroLlama model: {error_msg}"
+                    return f"Error calling Claude model: {error_msg}"
+    else:
+        # Use AstroLlama (fine-tuned Llama)
+        model_id = secrets.get("ASTROLLAMA_MODEL_ID")
+        
+        if not model_id:
+            return "Error: ASTROLLAMA_MODEL_ID not configured in secrets"
+        
+        # Build prompt in Llama 3 format
+        prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{AGENT_SYSTEM_PROMPT}<|eot_id|>"
+        
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            prompt += f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
+        
+        prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        
+        # Llama model request body
+        body = {
+            "prompt": prompt,
+            "max_gen_len": 2048,
+            "temperature": 0.7,
+            "top_p": 0.9
+        }
+        
+        # Retry with exponential backoff for throttling
+        for attempt in range(max_retries):
+            try:
+                response = client.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps(body)
+                )
+                result = json.loads(response["body"].read())
+                return result.get("generation", "")
+            except Exception as e:
+                error_msg = str(e)
+                
+                # Check if it's a throttling error
+                if "ThrottlingException" in error_msg or "Too many requests" in error_msg:
+                    if attempt < max_retries - 1:
+                        # Exponential backoff: 2, 4, 8, 16, 32 seconds
+                        wait_time = 2 ** (attempt + 1)
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return f"Error: Model rate limited. Please wait a minute and try again."
+                else:
+                    return f"Error calling AstroLlama model: {error_msg}"
     
     return "Error: Failed after multiple retries"
 
@@ -854,8 +902,26 @@ def render_sidebar():
         
         st.divider()
         
+        # Model selector
+        st.markdown("### 🤖 Model")
+        model_choice = st.selectbox(
+            "Select model",
+            ["AstroLlama (Fine-tuned)", "Claude 4.5 Sonnet"],
+            key="model_choice",
+            help="AstroLlama is fine-tuned for astronomy. Claude 4.5 is a general-purpose model."
+        )
+        
+        st.divider()
+        
         st.markdown("### System Status")
         secrets = get_secrets()
+        
+        # Show active model
+        active_model = st.session_state.get("model_choice", "AstroLlama (Fine-tuned)")
+        if active_model == "Claude 4.5 Sonnet":
+            st.markdown("🟣 **Active: Claude 4.5 Sonnet**")
+        else:
+            st.markdown("🦙 **Active: AstroLlama**")
         
         statuses = [
             ("AWS Bedrock", bool(secrets.get("AWS_ACCESS_KEY_ID"))),
