@@ -227,35 +227,129 @@ class AstroTools:
     
     @staticmethod
     def lookup_object(name: str) -> Dict:
-        """Look up object by name, resolve coordinates"""
+        """
+        Look up object by name using multiple resolvers.
+        Handles: star names, cluster names (M45, NGC), coordinates, 2MASS IDs, etc.
+        """
         try:
             from astropy.coordinates import SkyCoord
             from astroquery.simbad import Simbad
+            from astropy import units as u
+            import re
             
-            coord = SkyCoord.from_name(name)
-            ra, dec = coord.ra.degree, coord.dec.degree
+            ra, dec = None, None
+            resolved_name = name
             
-            simbad = Simbad()
-            simbad.add_votable_fields('otype', 'sptype', 'plx', 'pm', 
-                                      'flux(V)', 'flux(J)', 'flux(K)')
-            result = simbad.query_object(name)
+            # Check if input is already coordinates (e.g., "56.75 24.12" or "56.75, 24.12")
+            coord_pattern = r'^[\s]*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[\s]*$'
+            coord_match = re.match(coord_pattern, name.strip())
             
+            if coord_match:
+                ra = float(coord_match.group(1))
+                dec = float(coord_match.group(2))
+                resolved_name = f"Coordinates ({ra:.4f}, {dec:.4f})"
+            else:
+                # Try different name formats and resolvers
+                names_to_try = [name]
+                
+                # Handle common cluster aliases
+                cluster_aliases = {
+                    "pleiades": "M45",
+                    "hyades": "Mel 25",
+                    "orion nebula": "M42",
+                    "crab nebula": "M1",
+                    "andromeda": "M31",
+                    "praesepe": "M44",
+                    "beehive": "M44",
+                }
+                
+                name_lower = name.lower().strip()
+                if name_lower in cluster_aliases:
+                    names_to_try.insert(0, cluster_aliases[name_lower])
+                
+                # Also try with "cluster" suffix for known clusters
+                if name_lower in ["pleiades", "hyades", "praesepe"]:
+                    names_to_try.append(f"{name} cluster")
+                
+                # Try each name with SkyCoord.from_name (uses Sesame resolver)
+                for try_name in names_to_try:
+                    try:
+                        coord = SkyCoord.from_name(try_name)
+                        ra, dec = coord.ra.degree, coord.dec.degree
+                        resolved_name = try_name
+                        break
+                    except Exception:
+                        continue
+                
+                # If still not resolved, try SIMBAD directly with wildcards
+                if ra is None:
+                    try:
+                        simbad = Simbad()
+                        # Try exact match first
+                        result = simbad.query_object(name)
+                        if result and len(result) > 0:
+                            ra = float(result['RA'][0].replace(' ', ':').split(':')[0]) * 15  # Rough conversion
+                            dec = float(result['DEC'][0].replace(' ', ':').split(':')[0])
+                            # Get proper coordinates
+                            coord = SkyCoord(result['RA'][0], result['DEC'][0], unit=(u.hourangle, u.deg))
+                            ra, dec = coord.ra.degree, coord.dec.degree
+                    except Exception:
+                        pass
+            
+            if ra is None or dec is None:
+                # Last resort: provide known coordinates for common objects
+                known_coords = {
+                    "pleiades": (56.75, 24.12),
+                    "m45": (56.75, 24.12),
+                    "hyades": (66.75, 15.87),
+                    "orion": (83.82, -5.39),
+                    "m42": (83.82, -5.39),
+                    "trapezium": (83.82, -5.39),
+                    "taurus": (68.0, 28.0),  # Taurus star-forming region
+                    "rho ophiuchi": (246.79, -24.53),
+                    "rho oph": (246.79, -24.53),
+                    "ic 348": (56.13, 32.17),
+                    "chamaeleon": (168.0, -77.0),
+                    "upper sco": (244.0, -23.0),
+                    "upper scorpius": (244.0, -23.0),
+                }
+                
+                name_lower = name.lower().strip()
+                if name_lower in known_coords:
+                    ra, dec = known_coords[name_lower]
+                    resolved_name = f"{name} (from known coordinates)"
+                else:
+                    return {"error": f"Could not resolve '{name}'. Try providing coordinates directly (e.g., '56.75 24.12') or a catalog ID.", "resolved": False}
+            
+            # Now get additional info from SIMBAD
             info = {
                 "name": name,
+                "resolved_name": resolved_name,
                 "ra": round(ra, 6),
                 "dec": round(dec, 6),
                 "resolved": True
             }
             
-            if result:
-                df = result.to_pandas()
-                if len(df) > 0:
-                    row = df.iloc[0]
-                    info["object_type"] = str(row.get("OTYPE", ""))
-                    info["spectral_type"] = str(row.get("SP_TYPE", ""))
-                    info["parallax"] = float(row.get("PLX_VALUE", 0)) if pd.notna(row.get("PLX_VALUE")) else None
-                    info["pmra"] = float(row.get("PMRA", 0)) if pd.notna(row.get("PMRA")) else None
-                    info["pmdec"] = float(row.get("PMDEC", 0)) if pd.notna(row.get("PMDEC")) else None
+            try:
+                simbad = Simbad()
+                simbad.add_votable_fields('otype', 'sptype', 'plx', 'pm', 
+                                          'flux(V)', 'flux(J)', 'flux(K)')
+                result = simbad.query_object(resolved_name.split('(')[0].strip())
+                
+                if result:
+                    df = result.to_pandas()
+                    if len(df) > 0:
+                        row = df.iloc[0]
+                        info["object_type"] = str(row.get("OTYPE", ""))
+                        info["spectral_type"] = str(row.get("SP_TYPE", ""))
+                        if pd.notna(row.get("PLX_VALUE")):
+                            info["parallax"] = float(row.get("PLX_VALUE"))
+                        if pd.notna(row.get("PMRA")):
+                            info["pmra"] = float(row.get("PMRA"))
+                        if pd.notna(row.get("PMDEC")):
+                            info["pmdec"] = float(row.get("PMDEC"))
+            except Exception:
+                pass  # SIMBAD info is optional
             
             return info
             
@@ -358,10 +452,14 @@ AGENT_SYSTEM_PROMPT = """You are AstroLlama, an expert astronomical research ass
 Use when user provides coordinates OR after resolving an object name.
 Catalogs: gaia, 2mass, allwise, catwise, simbad
 Format: TOOL:CATALOG_QUERY|catalog=gaia|ra=180.0|dec=45.0|radius=60
+Note: For large regions like clusters, use radius=3600 (1 degree)
 
 ### 2. OBJECT_LOOKUP - Resolve object names to coordinates
-Use FIRST when user mentions any object by name.
-Format: TOOL:OBJECT_LOOKUP|name=TRAPPIST-1
+Use FIRST when user mentions any object by name (stars, clusters, regions).
+Works with: Star names, M/NGC numbers, cluster names (Pleiades, Hyades), coordinates
+Format: TOOL:OBJECT_LOOKUP|name=Pleiades
+Format: TOOL:OBJECT_LOOKUP|name=M45
+Format: TOOL:OBJECT_LOOKUP|name=56.75 24.12
 
 ### 3. LITERATURE_SEARCH - Search NASA ADS for papers
 Use for research questions or to cite sources.
@@ -372,36 +470,57 @@ Use for background information on concepts/methods.
 Format: TOOL:RAG_QUERY|query=T dwarf identification
 
 ### 5. CODE_EXECUTION - Run Python code
-Use for calculations, plotting, data analysis.
-Available: numpy, pandas, matplotlib, astropy
-Data from CATALOG_QUERY is available as: gaia_data, twomass_data, allwise_data, etc.
-Format: TOOL:CODE_EXECUTION|code=plt.scatter(gaia_data['bp_rp'], gaia_data['phot_g_mean_mag'])
+Use for calculations, plotting, data analysis, filtering.
+Available: numpy (np), pandas (pd), matplotlib.pyplot (plt), astropy
+Data from CATALOG_QUERY is available as DataFrames: gaia_data, twomass_data, allwise_data, etc.
+
+IMPORTANT 2MASS column names: Jmag, Hmag, Kmag (not J, H, K)
+IMPORTANT: Calculate colors like this: twomass_data['Jmag'] - twomass_data['Kmag']
+
+Format: TOOL:CODE_EXECUTION|code=<your python code>
 
 ## CRITICAL RULES
 
 1. **NEVER invent data** - Always use tools for real measurements
-2. **Object mentioned → OBJECT_LOOKUP first** to get coordinates
+2. **Object/cluster mentioned → OBJECT_LOOKUP first** to get coordinates
 3. **Coordinates given → CATALOG_QUERY** immediately  
 4. **Plot requested → CATALOG_QUERY then CODE_EXECUTION**
 5. **Chain tools**: lookup → catalog → code for complete analysis
-6. **Multiple catalogs**: Query Gaia + 2MASS + WISE for full photometry
+6. **For clusters**: Use radius=3600 (1 degree) to capture full region
+7. **Color calculations**: J-K = Jmag - Kmag, H-K = Hmag - Kmag
+
+## CODE EXAMPLES FOR COMMON TASKS
+
+Color-Color diagram (2MASS):
+```python
+jk = twomass_data['Jmag'] - twomass_data['Kmag']
+hk = twomass_data['Hmag'] - twomass_data['Kmag']
+plt.scatter(hk, jk, s=5, alpha=0.5)
+red = jk > 1.0
+plt.scatter(hk[red], jk[red], c='red', s=20, label='J-K > 1')
+plt.xlabel('H-K'); plt.ylabel('J-K'); plt.legend(); plt.title('Color-Color Diagram')
+```
+
+CMD with Gaia:
+```python
+plt.scatter(gaia_data['bp_rp'], gaia_data['phot_g_mean_mag'], s=5, alpha=0.5)
+plt.gca().invert_yaxis()
+plt.xlabel('BP-RP'); plt.ylabel('G mag'); plt.title('CMD')
+```
+
+Find reddest sources:
+```python
+twomass_data['JK'] = twomass_data['Jmag'] - twomass_data['Kmag']
+red_sources = twomass_data.nlargest(10, 'JK')
+print(red_sources[['RAJ2000', 'DEJ2000', 'Jmag', 'Hmag', 'Kmag', 'JK']])
+```
 
 ## RESPONSE FORMAT
 
 When using tools, output EXACTLY:
 TOOL:TOOL_NAME|param1=value1|param2=value2
 
-After tool results come back, either use more tools if needed, or provide your final answer WITHOUT tool tags.
-
-## EXAMPLES
-
-User: "Tell me about 2MASS J0559-1404"
-→ TOOL:OBJECT_LOOKUP|name=2MASS J0559-1404
-→ (get coords) TOOL:CATALOG_QUERY|catalog=gaia|ra=<ra>|dec=<dec>|radius=10
-
-User: "Plot CMD for sources at RA=180, Dec=45"
-→ TOOL:CATALOG_QUERY|catalog=gaia|ra=180|dec=45|radius=60
-→ TOOL:CODE_EXECUTION|code=plt.scatter(gaia_data['bp_rp'], gaia_data['phot_g_mean_mag']); plt.gca().invert_yaxis(); plt.xlabel('BP-RP'); plt.ylabel('G mag'); plt.title('CMD')
+After tool results, either use more tools or provide your final answer WITHOUT tool tags.
 
 Remember: Your value comes from providing REAL DATA from catalogs, not generic information."""
 
