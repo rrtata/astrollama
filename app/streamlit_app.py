@@ -1,599 +1,899 @@
 #!/usr/bin/env python3
 """
-AstroLlama - Streamlit Web UI
-Public-facing interface for the astronomy research assistant.
+AstroLlama - Agent-Integrated Chat Interface
+=============================================
+The fine-tuned AstroLlama model on Bedrock serves as the agent brain.
+Every user query goes through the agent loop where the model decides:
+- When to search catalogs (coordinates, object names detected)
+- When to query RAG (domain knowledge needed)
+- When to execute code (calculations, plots requested)
+- When to search literature (research questions)
+- When to just respond directly (simple questions)
 
-Run locally:
-    streamlit run app/streamlit_app.py
-
-Deploy to Streamlit Cloud:
-    1. Push to GitHub
-    2. Connect at share.streamlit.io
+The model sees tool results and incorporates them into its response.
 """
 
 import os
 import sys
 import json
+import base64
+import re
+import time
+from typing import Optional, Dict, List, Tuple, Any
+from dataclasses import dataclass, field
 import streamlit as st
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+import pandas as pd
+import numpy as np
+import boto3
+import requests
 
-# Load secrets from Streamlit Cloud if available
-# This must happen before any AWS clients are created
-try:
-    if hasattr(st, 'secrets'):
-        for key in ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_REGION', 'ASTROLLAMA_MODEL_ID', 'ADS_TOKEN', 'PINECONE_API_KEY']:
-            if key in st.secrets:
-                os.environ[key] = str(st.secrets[key])
-except Exception as e:
-    pass  # Running locally without secrets
-
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Page config
+# Page configuration
 st.set_page_config(
-    page_title="AstroLlama - Substellar Astronomy Assistant",
+    page_title="AstroLlama",
     page_icon="🦙",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# =============================================================================
-# Configuration
-# =============================================================================
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header { font-size: 2.5rem; font-weight: bold; color: #1E3A5F; }
+    .sub-header { font-size: 1.2rem; color: #666; margin-top: 0; }
+    .tool-used {
+        display: inline-block;
+        padding: 3px 10px;
+        border-radius: 15px;
+        font-size: 0.8rem;
+        margin: 2px;
+        font-weight: 500;
+    }
+    .tool-catalog { background-color: #e3f2fd; color: #1565c0; }
+    .tool-rag { background-color: #f3e5f5; color: #7b1fa2; }
+    .tool-code { background-color: #e8f5e9; color: #2e7d32; }
+    .tool-literature { background-color: #fff3e0; color: #ef6c00; }
+    .tool-lookup { background-color: #fce4ec; color: #c2185b; }
+    .thinking-box {
+        background-color: #f5f5f5;
+        border-left: 3px solid #9e9e9e;
+        padding: 10px;
+        margin: 10px 0;
+        font-size: 0.85rem;
+        color: #616161;
+    }
+    .source-chip {
+        display: inline-block;
+        background-color: #e0e0e0;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        margin: 2px;
+    }
+    .data-table {
+        font-size: 0.85rem;
+        max-height: 300px;
+        overflow-y: auto;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Model configuration
-BEDROCK_REGION = os.environ.get("AWS_REGION", "us-west-2")
-MODEL_ID = os.environ.get("ASTROLLAMA_MODEL_ID", "")  # Custom model deployment ARN
 
-# Check for required environment variables
-REQUIRED_ENV_VARS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
-
-
-def check_configuration() -> tuple[bool, List[str]]:
-    """Check if all required configuration is present."""
-    missing = []
-    for var in REQUIRED_ENV_VARS:
-        if not os.environ.get(var):
-            missing.append(var)
-    return len(missing) == 0, missing
-
-
-# =============================================================================
-# RAG Functions (must be before invoke_astrollama)
-# =============================================================================
+# ============ Configuration ============
 
 @st.cache_resource
-def get_rag_client():
-    """Initialize RAG client with Pinecone."""
+def get_secrets():
+    """Get secrets from Streamlit secrets or environment"""
+    secrets = {}
+    keys = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION",
+            "ASTROLLAMA_MODEL_ID", "ADS_TOKEN", "PINECONE_API_KEY"]
+    
+    for key in keys:
+        if hasattr(st, 'secrets') and key in st.secrets:
+            secrets[key] = st.secrets[key]
+        else:
+            secrets[key] = os.environ.get(key, "")
+    
+    return secrets
+
+
+@st.cache_resource
+def init_bedrock_client():
+    """Initialize AWS Bedrock client"""
+    secrets = get_secrets()
+    try:
+        return boto3.client(
+            service_name="bedrock-runtime",
+            region_name=secrets.get("AWS_REGION", "us-west-2"),
+            aws_access_key_id=secrets.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=secrets.get("AWS_SECRET_ACCESS_KEY")
+        )
+    except Exception as e:
+        st.error(f"Failed to initialize AWS client: {e}")
+        return None
+
+
+@st.cache_resource
+def init_rag_client():
+    """Initialize Pinecone RAG client"""
+    secrets = get_secrets()
+    if not secrets.get("PINECONE_API_KEY"):
+        return None
+    
     try:
         from pinecone import Pinecone
         from sentence_transformers import SentenceTransformer
         
-        # Get API key
-        api_key = os.environ.get("PINECONE_API_KEY", "")
-        
-        if not api_key:
-            # Try AWS Secrets Manager
-            try:
-                import boto3
-                client = boto3.client("secretsmanager", region_name="us-west-2")
-                response = client.get_secret_value(SecretId="astrollama/api-keys")
-                secrets = json.loads(response["SecretString"])
-                api_key = secrets.get("PINECONE_API_KEY", "")
-            except:
-                pass
-        
-        if not api_key:
-            return None, None
-        
-        pc = Pinecone(api_key=api_key)
+        pc = Pinecone(api_key=secrets["PINECONE_API_KEY"])
         index = pc.Index("astrollama-rag")
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        return index, model
-    
+        encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        return {"index": index, "encoder": encoder}
     except Exception as e:
-        return None, None
-
-
-def rag_search(query: str, top_k: int = 5, filter_source: str = "All") -> list:
-    """Search RAG index."""
-    index, model = get_rag_client()
-    
-    if index is None or model is None:
-        return []
-    
-    try:
-        # Generate query embedding
-        query_embedding = model.encode([query])[0].tolist()
-        
-        # Build filter
-        filter_dict = None
-        if filter_source == "ADS Papers":
-            filter_dict = {"source": {"$eq": "ads"}}
-        elif filter_source == "Documentation":
-            filter_dict = {"source": {"$eq": "documentation"}}
-        
-        # Query Pinecone
-        results = index.query(
-            vector=query_embedding,
-            top_k=top_k,
-            include_metadata=True,
-            filter=filter_dict
-        )
-        
-        # Format results
-        formatted = []
-        for match in results.matches:
-            formatted.append({
-                "score": match.score,
-                "text": match.metadata.get("text", ""),
-                "metadata": {k: v for k, v in match.metadata.items() if k != "text"}
-            })
-        
-        return formatted
-    
-    except Exception as e:
-        return []
-
-
-# =============================================================================
-# Bedrock Client
-# =============================================================================
-
-@st.cache_resource
-def get_bedrock_client():
-    """Get Bedrock runtime client."""
-    try:
-        import boto3
-        return boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
-    except Exception as e:
-        st.error(f"Failed to create Bedrock client: {e}")
         return None
 
 
-def invoke_astrollama(prompt: str, system_prompt: str = None, max_tokens: int = 2048, use_rag: bool = True) -> str:
-    """Invoke the AstroLlama model with optional RAG enhancement."""
-    client = get_bedrock_client()
-    if not client:
-        return "Error: Bedrock client not available"
+# ============ Tool Implementations ============
+
+class AstroTools:
+    """Collection of tools the agent can use"""
     
-    # RAG: Search for relevant context first
-    rag_context = ""
-    rag_sources = []
-    
-    if use_rag:
+    @staticmethod
+    def search_literature(query: str, max_results: int = 5) -> Dict:
+        """Search NASA ADS for papers"""
+        secrets = get_secrets()
+        token = secrets.get("ADS_TOKEN")
+        
+        if not token:
+            return {"error": "ADS_TOKEN not configured", "data": []}
+        
+        headers = {"Authorization": f"Bearer {token}"}
+        url = "https://api.adsabs.harvard.edu/v1/search/query"
+        
+        params = {
+            "q": query,
+            "fl": "bibcode,title,abstract,author,year,citation_count",
+            "rows": max_results,
+            "sort": "citation_count desc"
+        }
+        
         try:
-            results = rag_search(prompt, top_k=3)
-            if results:
-                context_texts = []
-                for r in results:
-                    context_texts.append(r.get("text", ""))
-                    # Track sources
-                    meta = r.get("metadata", {})
-                    if meta.get("title"):
-                        rag_sources.append(f"- {meta.get('title', '')[:60]}...")
-                    elif meta.get("survey"):
-                        rag_sources.append(f"- {meta.get('survey')} documentation")
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            papers = response.json().get("response", {}).get("docs", [])
+            
+            results = []
+            for p in papers:
+                results.append({
+                    "title": p.get("title", [""])[0] if isinstance(p.get("title"), list) else p.get("title", ""),
+                    "authors": ", ".join(p.get("author", [])[:3]),
+                    "year": p.get("year", ""),
+                    "citations": p.get("citation_count", 0),
+                    "abstract": (p.get("abstract", "")[:200] + "...") if p.get("abstract") else "",
+                    "bibcode": p.get("bibcode", "")
+                })
+            
+            return {"data": results, "query": query}
+        except Exception as e:
+            return {"error": str(e), "data": []}
+    
+    @staticmethod
+    def query_catalog(catalog: str, ra: float, dec: float, radius: float = 60) -> Dict:
+        """Query astronomical catalog by coordinates"""
+        try:
+            from astropy.coordinates import SkyCoord
+            from astropy import units as u
+            
+            coord = SkyCoord(ra=ra, dec=dec, unit=(u.degree, u.degree), frame='icrs')
+            
+            if catalog.lower() == "gaia":
+                from astroquery.gaia import Gaia
+                Gaia.ROW_LIMIT = 500
+                radius_deg = radius / 3600.0
                 
-                rag_context = "\n\n".join(context_texts)
-        except:
-            pass  # Continue without RAG if it fails
+                query = f"""
+                SELECT source_id, ra, dec, parallax, parallax_error,
+                       pmra, pmdec, phot_g_mean_mag, phot_bp_mean_mag, 
+                       phot_rp_mean_mag, bp_rp
+                FROM gaiadr3.gaia_source
+                WHERE CONTAINS(POINT('ICRS', ra, dec),
+                    CIRCLE('ICRS', {ra}, {dec}, {radius_deg})) = 1
+                ORDER BY phot_g_mean_mag ASC
+                """
+                job = Gaia.launch_job(query)
+                result = job.get_results()
+                df = result.to_pandas()
+                
+            elif catalog.lower() in ["2mass", "allwise", "catwise"]:
+                from astroquery.vizier import Vizier
+                
+                catalog_map = {
+                    "2mass": "II/246/out",
+                    "allwise": "II/328/allwise",
+                    "catwise": "II/365/catwise"
+                }
+                
+                vizier = Vizier(row_limit=500)
+                result = vizier.query_region(coord, radius=radius*u.arcsec, 
+                                            catalog=catalog_map[catalog.lower()])
+                df = result[0].to_pandas() if result else pd.DataFrame()
+                
+            elif catalog.lower() == "simbad":
+                from astroquery.simbad import Simbad
+                
+                simbad = Simbad()
+                simbad.add_votable_fields('otype', 'sptype', 'plx', 'pm')
+                result = simbad.query_region(coord, radius=radius*u.arcsec)
+                df = result.to_pandas() if result else pd.DataFrame()
+            
+            else:
+                return {"error": f"Unknown catalog: {catalog}", "data": []}
+            
+            # Convert to list of dicts for JSON serialization
+            if len(df) > 0:
+                return {
+                    "catalog": catalog.upper(),
+                    "total_found": len(df),
+                    "data": df.head(20).to_dict(orient="records"),
+                    "columns": list(df.columns),
+                    "full_data": df,  # Keep full DataFrame for code execution
+                    "ra": ra, "dec": dec, "radius": radius
+                }
+            else:
+                return {"catalog": catalog.upper(), "total_found": 0, "data": [], 
+                        "ra": ra, "dec": dec, "radius": radius}
+                
+        except Exception as e:
+            return {"error": str(e), "data": []}
     
-    # Default system prompt
-    if not system_prompt:
-        system_prompt = """You are AstroLlama, an expert astronomy research assistant specializing in:
-- Brown dwarfs (L, T, Y dwarfs) and ultracool objects
-- Exoplanet atmospheres and characterization
-- Astronomical catalog queries (Gaia, SDSS, 2MASS, WISE)
-- Spectral classification and analysis
-- Data visualization and analysis
-
-Provide accurate, practical advice with code examples when appropriate."""
+    @staticmethod
+    def lookup_object(name: str) -> Dict:
+        """Look up object by name, resolve coordinates"""
+        try:
+            from astropy.coordinates import SkyCoord
+            from astroquery.simbad import Simbad
+            
+            # Resolve coordinates
+            coord = SkyCoord.from_name(name)
+            ra, dec = coord.ra.degree, coord.dec.degree
+            
+            # Get SIMBAD info
+            simbad = Simbad()
+            simbad.add_votable_fields('otype', 'sptype', 'plx', 'pm', 
+                                      'flux(V)', 'flux(J)', 'flux(K)')
+            result = simbad.query_object(name)
+            
+            info = {
+                "name": name,
+                "ra": round(ra, 6),
+                "dec": round(dec, 6),
+                "resolved": True
+            }
+            
+            if result:
+                df = result.to_pandas()
+                if len(df) > 0:
+                    row = df.iloc[0]
+                    info["object_type"] = str(row.get("OTYPE", ""))
+                    info["spectral_type"] = str(row.get("SP_TYPE", ""))
+                    info["parallax"] = float(row.get("PLX_VALUE", 0)) if pd.notna(row.get("PLX_VALUE")) else None
+                    info["pmra"] = float(row.get("PMRA", 0)) if pd.notna(row.get("PMRA")) else None
+                    info["pmdec"] = float(row.get("PMDEC", 0)) if pd.notna(row.get("PMDEC")) else None
+            
+            return info
+            
+        except Exception as e:
+            return {"error": str(e), "resolved": False}
     
-    # Add RAG context to prompt if available
-    if rag_context:
-        enhanced_prompt = f"""I found the following relevant information from astronomy papers and documentation:
-
----
-{rag_context}
----
-
-Based on this context and your knowledge, please answer: {prompt}"""
-    else:
-        enhanced_prompt = prompt
+    @staticmethod
+    def query_rag(query: str, top_k: int = 3) -> Dict:
+        """Query the RAG knowledge base"""
+        rag_client = init_rag_client()
+        
+        if not rag_client:
+            return {"error": "RAG not configured", "data": []}
+        
+        try:
+            embedding = rag_client["encoder"].encode(query).tolist()
+            results = rag_client["index"].query(
+                vector=embedding, top_k=top_k, include_metadata=True
+            )
+            
+            passages = []
+            for match in results.matches:
+                passages.append({
+                    "score": round(match.score, 3),
+                    "text": match.metadata.get("text", ""),
+                    "source": match.metadata.get("source", "unknown"),
+                    "title": match.metadata.get("title", "")
+                })
+            
+            return {"data": passages, "query": query}
+        except Exception as e:
+            return {"error": str(e), "data": []}
     
-    # Format prompt for Llama
-    formatted_prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-{enhanced_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
+    @staticmethod
+    def execute_code(code: str, data_context: Dict = None) -> Dict:
+        """Execute Python code and capture output/plots"""
+        import io
+        import contextlib
+        import traceback
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        
+        # Set up namespace with pre-loaded libraries
+        namespace = {}
+        setup = """
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from astropy import units as u
+from astropy.coordinates import SkyCoord
+import warnings
+warnings.filterwarnings('ignore')
+plt.style.use('default')
+plt.rcParams['figure.figsize'] = [10, 6]
+plt.rcParams['figure.dpi'] = 100
 """
-    
-    try:
-        # Use custom model if available, otherwise use base model
-        model_id = MODEL_ID or "meta.llama3-3-70b-instruct-v1:0"
+        exec(setup, namespace)
         
-        response = client.invoke_model(
-            modelId=model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({
-                "prompt": formatted_prompt,
-                "max_gen_len": max_tokens,
-                "temperature": 0.7,
-                "top_p": 0.9
-            })
+        # Inject data from previous tool calls
+        if data_context:
+            for name, data in data_context.items():
+                if isinstance(data, pd.DataFrame):
+                    namespace[name] = data
+                elif isinstance(data, dict) and 'full_data' in data:
+                    namespace[name] = data['full_data']
+        
+        stdout_capture = io.StringIO()
+        plots = []
+        error = None
+        
+        try:
+            with contextlib.redirect_stdout(stdout_capture):
+                exec(code, namespace)
+            
+            # Capture plots
+            for fig_num in plt.get_fignums():
+                fig = plt.figure(fig_num)
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', bbox_inches='tight', 
+                           dpi=100, facecolor='white')
+                buf.seek(0)
+                plots.append(base64.b64encode(buf.read()).decode('utf-8'))
+            plt.close('all')
+            
+        except Exception as e:
+            error = traceback.format_exc()
+        
+        return {
+            "output": stdout_capture.getvalue(),
+            "plots": plots,
+            "error": error
+        }
+
+
+# ============ Agent System Prompt ============
+
+AGENT_SYSTEM_PROMPT = """You are AstroLlama, an expert astronomical research assistant specializing in brown dwarfs, substellar objects, and stellar astrophysics. You have access to powerful tools that you MUST use to provide accurate, data-driven responses.
+
+## YOUR TOOLS
+
+### 1. CATALOG_QUERY - Query astronomical databases
+Use when user provides coordinates OR after resolving an object name.
+Catalogs: gaia, 2mass, allwise, catwise, simbad
+Format: TOOL:CATALOG_QUERY|catalog=gaia|ra=180.0|dec=45.0|radius=60
+
+### 2. OBJECT_LOOKUP - Resolve object names to coordinates
+Use FIRST when user mentions any object by name.
+Format: TOOL:OBJECT_LOOKUP|name=TRAPPIST-1
+
+### 3. LITERATURE_SEARCH - Search NASA ADS for papers
+Use for research questions or to cite sources.
+Format: TOOL:LITERATURE_SEARCH|query=brown dwarf atmospheres|max_results=5
+
+### 4. RAG_QUERY - Search knowledge base
+Use for background information on concepts/methods.
+Format: TOOL:RAG_QUERY|query=T dwarf identification
+
+### 5. CODE_EXECUTION - Run Python code
+Use for calculations, plotting, data analysis.
+Available: numpy, pandas, matplotlib, astropy
+Data from CATALOG_QUERY is available as: gaia_data, twomass_data, allwise_data, etc.
+Format: TOOL:CODE_EXECUTION|code=plt.scatter(gaia_data['bp_rp'], gaia_data['phot_g_mean_mag'])
+
+## CRITICAL RULES
+
+1. **NEVER invent data** - Always use tools for real measurements
+2. **Object mentioned → OBJECT_LOOKUP first** to get coordinates
+3. **Coordinates given → CATALOG_QUERY** immediately  
+4. **Plot requested → CATALOG_QUERY then CODE_EXECUTION**
+5. **Chain tools**: lookup → catalog → code for complete analysis
+6. **Multiple catalogs**: Query Gaia + 2MASS + WISE for full photometry
+
+## RESPONSE FORMAT
+
+When using tools, output EXACTLY:
+TOOL:TOOL_NAME|param1=value1|param2=value2
+
+After tool results come back, either:
+- Use more tools if needed
+- Provide final answer with insights from the data
+
+## EXAMPLES
+
+User: "Tell me about 2MASS J0559-1404"
+→ TOOL:OBJECT_LOOKUP|name=2MASS J0559-1404
+→ (get coords) TOOL:CATALOG_QUERY|catalog=gaia|ra=<ra>|dec=<dec>|radius=10
+→ TOOL:CATALOG_QUERY|catalog=2mass|ra=<ra>|dec=<dec>|radius=10
+→ Synthesize info into response
+
+User: "Plot CMD for sources at RA=180, Dec=45"
+→ TOOL:CATALOG_QUERY|catalog=gaia|ra=180|dec=45|radius=60
+→ TOOL:CODE_EXECUTION|code=plt.scatter(gaia_data['bp_rp'], gaia_data['phot_g_mean_mag']); plt.gca().invert_yaxis(); plt.xlabel('BP-RP'); plt.ylabel('G mag'); plt.title('CMD')
+
+User: "What colors identify T dwarfs?"
+→ TOOL:RAG_QUERY|query=T dwarf color identification criteria
+→ TOOL:LITERATURE_SEARCH|query=T dwarf photometric classification
+→ Provide answer with citations
+
+Remember: Your value comes from providing REAL DATA from catalogs, not generic information."""
+
+
+# ============ Agent Core ============
+
+@dataclass
+class AgentState:
+    """State maintained across the agent loop"""
+    tools_used: List[str] = field(default_factory=list)
+    tool_results: List[Dict] = field(default_factory=list)
+    sources: List[str] = field(default_factory=list)
+    plots: List[str] = field(default_factory=list)
+    data_context: Dict[str, Any] = field(default_factory=dict)
+
+
+def parse_tool_calls(response: str) -> List[Tuple[str, Dict]]:
+    """Parse tool calls from model response"""
+    tool_pattern = r'TOOL:(\w+)\|(.+?)(?=TOOL:|$|\n\n)'
+    matches = re.findall(tool_pattern, response, re.DOTALL)
+    
+    calls = []
+    for tool_name, params_str in matches:
+        params = {}
+        for param in params_str.strip().split('|'):
+            if '=' in param:
+                key, value = param.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Type conversion
+                if key in ['ra', 'dec', 'radius']:
+                    try:
+                        value = float(value)
+                    except:
+                        pass
+                elif key in ['max_results', 'top_k']:
+                    try:
+                        value = int(value)
+                    except:
+                        pass
+                
+                params[key] = value
+        
+        calls.append((tool_name.upper(), params))
+    
+    return calls
+
+
+def execute_tool(tool_name: str, params: Dict, state: AgentState) -> str:
+    """Execute a tool and return formatted result"""
+    state.tools_used.append(tool_name)
+    
+    if tool_name == "CATALOG_QUERY":
+        result = AstroTools.query_catalog(
+            catalog=params.get("catalog", "gaia"),
+            ra=params.get("ra", 0),
+            dec=params.get("dec", 0),
+            radius=params.get("radius", 60)
         )
+        state.tool_results.append({"tool": tool_name, "result": result})
         
-        result = json.loads(response["body"].read())
-        answer = result.get("generation", "No response generated")
-        
-        # Append sources if RAG was used
-        if rag_sources:
-            answer += "\n\n---\n📚 **Sources used:**\n" + "\n".join(rag_sources[:3])
-        
-        return answer
-        
-    except Exception as e:
-        return f"Error invoking model: {str(e)}"
+        if result.get("data") or result.get("full_data") is not None:
+            # Store data for code execution
+            catalog_name = params.get('catalog', 'data').lower()
+            if 'full_data' in result:
+                state.data_context[f"{catalog_name}_data"] = result['full_data']
+            else:
+                state.data_context[f"{catalog_name}_data"] = pd.DataFrame(result['data'])
+            
+            df_display = pd.DataFrame(result['data']) if result.get('data') else result.get('full_data', pd.DataFrame()).head(10)
+            
+            return f"""CATALOG QUERY RESULT ({result.get('catalog', 'Unknown')}):
+Found {result.get('total_found', 0)} sources at RA={params.get('ra'):.4f}, Dec={params.get('dec'):.4f}, radius={params.get('radius')}\"
+Columns: {', '.join(result.get('columns', [])[:8])}
+Data available as '{catalog_name}_data' for code execution.
 
-
-# =============================================================================
-# Agent Tools
-# =============================================================================
-
-@st.cache_resource
-def get_tool_registry():
-    """Get the tool registry."""
-    try:
-        from src.agents.tools import ToolRegistry
-        return ToolRegistry()
-    except ImportError:
-        st.warning("Agent tools not available. Install dependencies.")
-        return None
-
-
-def execute_tool(tool_name: str, **kwargs) -> Dict:
-    """Execute an agent tool."""
-    registry = get_tool_registry()
-    if not registry:
-        return {"success": False, "error": "Tools not available"}
+Sample (first 5 rows):
+{df_display.head(5).to_string()}
+"""
+        else:
+            return f"CATALOG QUERY: No sources found. Error: {result.get('error', 'None')}"
     
-    result = registry.execute(tool_name, **kwargs)
-    return result.to_dict()
+    elif tool_name == "OBJECT_LOOKUP":
+        result = AstroTools.lookup_object(params.get("name", ""))
+        state.tool_results.append({"tool": tool_name, "result": result})
+        
+        if result.get("resolved"):
+            # Store coordinates for subsequent catalog queries
+            state.data_context["last_ra"] = result.get("ra")
+            state.data_context["last_dec"] = result.get("dec")
+            
+            return f"""OBJECT LOOKUP RESULT:
+Name: {result.get('name')}
+RA: {result.get('ra'):.6f} deg
+Dec: {result.get('dec'):.6f} deg
+Object Type: {result.get('object_type', 'Unknown')}
+Spectral Type: {result.get('spectral_type', 'N/A')}
+Parallax: {result.get('parallax', 'N/A')} mas
+Proper Motion: ({result.get('pmra', 'N/A')}, {result.get('pmdec', 'N/A')}) mas/yr
+
+You can now query catalogs at these coordinates."""
+        else:
+            return f"OBJECT LOOKUP FAILED: Could not resolve '{params.get('name')}'. Error: {result.get('error', 'Unknown')}"
+    
+    elif tool_name == "LITERATURE_SEARCH":
+        result = AstroTools.search_literature(
+            query=params.get("query", ""),
+            max_results=params.get("max_results", 5)
+        )
+        state.tool_results.append({"tool": tool_name, "result": result})
+        
+        if result.get("data"):
+            papers_str = f"LITERATURE SEARCH RESULT for '{params.get('query')}':\n\n"
+            for i, p in enumerate(result["data"], 1):
+                papers_str += f"{i}. {p['title']} ({p['year']})\n"
+                papers_str += f"   Authors: {p['authors']}\n"
+                papers_str += f"   Citations: {p['citations']} | Bibcode: {p['bibcode']}\n\n"
+                state.sources.append(p['bibcode'])
+            return papers_str
+        else:
+            return f"LITERATURE SEARCH: No papers found. Error: {result.get('error', 'None')}"
+    
+    elif tool_name == "RAG_QUERY":
+        result = AstroTools.query_rag(
+            query=params.get("query", ""),
+            top_k=params.get("top_k", 3)
+        )
+        state.tool_results.append({"tool": tool_name, "result": result})
+        
+        if result.get("data"):
+            rag_str = f"RAG KNOWLEDGE BASE RESULT for '{params.get('query')}':\n\n"
+            for i, p in enumerate(result["data"], 1):
+                rag_str += f"{i}. Source: {p['source']} (relevance: {p['score']})\n"
+                rag_str += f"   {p['text'][:400]}...\n\n"
+            return rag_str
+        else:
+            return f"RAG QUERY: No relevant information found. Error: {result.get('error', 'None')}"
+    
+    elif tool_name == "CODE_EXECUTION":
+        code = params.get("code", "")
+        result = AstroTools.execute_code(code, state.data_context)
+        state.tool_results.append({"tool": tool_name, "result": result})
+        
+        if result.get("plots"):
+            state.plots.extend(result["plots"])
+        
+        output_str = "CODE EXECUTION RESULT:\n"
+        if result.get("output"):
+            output_str += f"Output:\n{result['output']}\n"
+        if result.get("plots"):
+            output_str += f"✓ Generated {len(result['plots'])} plot(s) - displayed below\n"
+        if result.get("error"):
+            output_str += f"Error:\n{result['error']}\n"
+        if not result.get("output") and not result.get("plots") and not result.get("error"):
+            output_str += "Code executed successfully (no output)\n"
+        
+        return output_str
+    
+    else:
+        return f"Unknown tool: {tool_name}"
 
 
-# =============================================================================
-# UI Components
-# =============================================================================
+def call_astrollama(messages: List[Dict], client) -> str:
+    """Call AstroLlama model on Bedrock"""
+    secrets = get_secrets()
+    model_id = secrets.get("ASTROLLAMA_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
+    
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4096,
+        "system": AGENT_SYSTEM_PROMPT,
+        "messages": messages
+    }
+    
+    try:
+        response = client.invoke_model(modelId=model_id, body=json.dumps(body))
+        result = json.loads(response["body"].read())
+        return result["content"][0]["text"]
+    except Exception as e:
+        # Fallback to Claude
+        try:
+            response = client.invoke_model(
+                modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+                body=json.dumps(body)
+            )
+            result = json.loads(response["body"].read())
+            return result["content"][0]["text"]
+        except Exception as e2:
+            return f"Error calling model: {e2}"
+
+
+def run_agent(user_query: str, client, progress_callback=None, max_iterations: int = 6) -> Tuple[str, AgentState]:
+    """Run the agent loop"""
+    state = AgentState()
+    messages = [{"role": "user", "content": user_query}]
+    
+    for iteration in range(max_iterations):
+        if progress_callback:
+            progress_callback(f"Step {iteration + 1}: Analyzing...")
+        
+        # Get model response
+        response = call_astrollama(messages, client)
+        
+        # Parse tool calls
+        tool_calls = parse_tool_calls(response)
+        
+        if not tool_calls:
+            # No tool calls - this is the final answer
+            return response, state
+        
+        # Execute tools
+        tool_results_text = []
+        for tool_name, params in tool_calls:
+            if progress_callback:
+                progress_callback(f"Using {tool_name.replace('_', ' ').title()}...")
+            
+            result_text = execute_tool(tool_name, params, state)
+            tool_results_text.append(result_text)
+        
+        # Add to conversation
+        messages.append({"role": "assistant", "content": response})
+        messages.append({
+            "role": "user",
+            "content": f"""Tool Results:
+
+{chr(10).join(tool_results_text)}
+
+---
+Based on these results, continue your analysis. 
+- If you need more data, use additional tools.
+- If you have enough information, provide your comprehensive answer WITHOUT tool tags.
+- Remember to reference specific values from the data."""
+        })
+    
+    # Max iterations reached - ask for final answer
+    messages.append({
+        "role": "user", 
+        "content": "Please provide your final answer now based on all the information gathered."
+    })
+    final_response = call_astrollama(messages, client)
+    
+    return final_response, state
+
+
+# ============ Sidebar ============
 
 def render_sidebar():
-    """Render the sidebar with settings and tools."""
-    
+    """Render the sidebar"""
     with st.sidebar:
-        st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/4/4f/Llama_lying_down.jpg/320px-Llama_lying_down.jpg", width=100)
-        st.title("🦙 AstroLlama")
-        st.caption("Substellar Astronomy Assistant")
+        st.markdown("## 🦙 AstroLlama")
+        st.markdown("*Agent-Powered Research Assistant*")
         
         st.divider()
         
-        # Mode selection
-        mode = st.radio(
-            "Mode",
-            ["💬 Chat", "🔧 Tools", "📚 RAG Search"],
-            index=0
-        )
+        # System status
+        st.markdown("### System Status")
+        secrets = get_secrets()
+        
+        statuses = [
+            ("AWS Bedrock", bool(secrets.get("AWS_ACCESS_KEY_ID"))),
+            ("RAG Knowledge Base", bool(secrets.get("PINECONE_API_KEY"))),
+            ("NASA ADS", bool(secrets.get("ADS_TOKEN")))
+        ]
+        
+        for name, status in statuses:
+            icon = "✅" if status else "❌"
+            st.markdown(f"{icon} {name}")
         
         st.divider()
         
-        # Tool shortcuts
-        st.subheader("Quick Tools")
-        
-        if st.button("🔍 Search ADS", use_container_width=True):
-            st.session_state.active_tool = "search_ads"
-        
-        if st.button("📄 Search arXiv", use_container_width=True):
-            st.session_state.active_tool = "search_arxiv"
-        
-        if st.button("⭐ Query Gaia", use_container_width=True):
-            st.session_state.active_tool = "query_gaia"
-        
-        if st.button("🌡️ Brown Dwarf Search", use_container_width=True):
-            st.session_state.active_tool = "brown_dwarf_search"
+        # Available tools info
+        st.markdown("### 🛠️ Available Tools")
+        st.caption("The agent automatically uses these based on your query:")
+        tools_info = [
+            ("🔭 Catalogs", "Gaia, 2MASS, WISE, SIMBAD"),
+            ("🔍 Object Lookup", "Name → Coordinates"),
+            ("📚 Literature", "NASA ADS papers"),
+            ("🧠 Knowledge Base", "RAG retrieval"),
+            ("💻 Code & Plots", "Python analysis")
+        ]
+        for tool, desc in tools_info:
+            st.markdown(f"**{tool}**: {desc}")
         
         st.divider()
         
-        # Settings
-        with st.expander("⚙️ Settings"):
-            st.number_input("Max tokens", min_value=256, max_value=4096, value=1024, key="max_tokens")
-            st.slider("Temperature", 0.0, 1.0, 0.7, key="temperature")
-            st.checkbox("📚 Use RAG (search papers first)", value=True, key="use_rag")
+        # Clear chat
+        if st.button("🗑️ Clear Chat", use_container_width=True):
+            st.session_state.messages = []
+            st.session_state.agent_states = []
+            st.rerun()
         
-        # Status
         st.divider()
-        config_ok, missing = check_configuration()
-        if config_ok:
-            st.success("✅ Connected")
-        else:
-            st.warning(f"⚠️ Missing: {', '.join(missing)}")
         
-        return mode
+        # Example queries
+        st.markdown("### 💡 Try These")
+        examples = [
+            "What do we know about TRAPPIST-1?",
+            "Plot a CMD for RA=83.8, Dec=-5.4 (Orion)",
+            "Find brown dwarfs near 2MASS J0559-1404",
+            "How do I identify L dwarfs from colors?",
+            "Recent papers on Y dwarf atmospheres"
+        ]
+        for ex in examples:
+            if st.button(ex, key=f"ex_{hash(ex)}", use_container_width=True):
+                st.session_state.pending_query = ex
+                st.rerun()
 
 
-def render_chat_mode():
-    """Render the chat interface."""
+def render_tool_badges(tools_used: List[str]):
+    """Render badges for tools that were used"""
+    if not tools_used:
+        return
     
-    st.header("💬 Chat with AstroLlama")
-    st.caption("Ask questions about brown dwarfs, exoplanets, spectral classification, and more.")
+    badge_map = {
+        "CATALOG_QUERY": ("🔭 Catalog", "tool-catalog"),
+        "OBJECT_LOOKUP": ("🔍 Lookup", "tool-lookup"),
+        "LITERATURE_SEARCH": ("📚 Literature", "tool-literature"),
+        "RAG_QUERY": ("🧠 Knowledge", "tool-rag"),
+        "CODE_EXECUTION": ("💻 Code", "tool-code")
+    }
     
-    # Initialize chat history
+    badges_html = "<div style='margin: 10px 0;'>"
+    for tool in set(tools_used):
+        display, css_class = badge_map.get(tool, (tool, "tool-catalog"))
+        badges_html += f'<span class="tool-used {css_class}">{display}</span>'
+    badges_html += "</div>"
+    
+    st.markdown(badges_html, unsafe_allow_html=True)
+
+
+# ============ Main ============
+
+def main():
+    """Main application"""
+    # Initialize session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "agent_states" not in st.session_state:
+        st.session_state.agent_states = []
+    
+    # Render sidebar
+    render_sidebar()
+    
+    # Header
+    st.markdown('<p class="main-header">🦙 AstroLlama</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Ask me anything about astronomy — I\'ll search catalogs, find papers, and create plots automatically.</p>', unsafe_allow_html=True)
+    
+    # Initialize client
+    client = init_bedrock_client()
+    if client is None:
+        st.error("Could not connect to AWS Bedrock. Check your credentials.")
+        return
+    
+    st.divider()
     
     # Display chat history
-    for message in st.session_state.messages:
+    for i, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            
+            # Show extras for assistant messages
+            if message["role"] == "assistant" and i // 2 < len(st.session_state.agent_states):
+                state = st.session_state.agent_states[i // 2]
+                
+                render_tool_badges(state.tools_used)
+                
+                # Show plots
+                for j, plot_b64 in enumerate(state.plots):
+                    st.image(f"data:image/png;base64,{plot_b64}")
+                
+                # Expandable sections
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if state.sources:
+                        with st.expander(f"📚 Sources ({len(state.sources)})"):
+                            for src in list(set(state.sources))[:5]:
+                                st.markdown(f"[{src}](https://ui.adsabs.harvard.edu/abs/{src})")
+                
+                with col2:
+                    if state.data_context:
+                        data_items = [(k, v) for k, v in state.data_context.items() 
+                                     if isinstance(v, pd.DataFrame)]
+                        if data_items:
+                            with st.expander(f"📊 Data ({len(data_items)} tables)"):
+                                for name, df in data_items:
+                                    st.markdown(f"**{name}**: {len(df)} rows")
+                                    st.dataframe(df.head(5), use_container_width=True)
+                                    st.download_button(
+                                        f"Download {name}",
+                                        df.to_csv(index=False),
+                                        f"{name}.csv",
+                                        key=f"dl_{name}_{i}"
+                                    )
     
-    # Chat input
-    if prompt := st.chat_input("Ask me about substellar astronomy..."):
+    # Handle pending query from sidebar
+    if "pending_query" in st.session_state:
+        prompt = st.session_state.pending_query
+        del st.session_state.pending_query
+    else:
+        prompt = st.chat_input("Ask about any astronomical object, coordinates, or topic...")
+    
+    # Process new query
+    if prompt:
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
+        
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Generate response
+        # Run agent
         with st.chat_message("assistant"):
-            with st.spinner("Searching papers & thinking..."):
-                use_rag = st.session_state.get("use_rag", True)
-                response = invoke_astrollama(prompt, max_tokens=st.session_state.get("max_tokens", 1024), use_rag=use_rag)
+            status = st.empty()
+            
+            def update_status(msg):
+                status.markdown(f"*{msg}*")
+            
+            update_status("🔭 Analyzing your query...")
+            
+            response, state = run_agent(prompt, client, progress_callback=update_status)
+            
+            status.empty()
+            
             st.markdown(response)
-        
-        # Add assistant message
-        st.session_state.messages.append({"role": "assistant", "content": response})
-    
-    # Quick prompts
-    st.divider()
-    st.subheader("Try these prompts:")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("How do I classify T dwarfs using WISE colors?"):
-            st.session_state.quick_prompt = "How do I classify T dwarfs using WISE colors?"
-            st.rerun()
-        
-        if st.button("Write a Gaia query for brown dwarf candidates"):
-            st.session_state.quick_prompt = "Write a Gaia DR3 query to find brown dwarf candidates within 25 parsecs"
-            st.rerun()
-    
-    with col2:
-        if st.button("What spectral indices distinguish L from T dwarfs?"):
-            st.session_state.quick_prompt = "What spectral indices are used to distinguish L dwarfs from T dwarfs?"
-            st.rerun()
-        
-        if st.button("How can I use Euclid data for ultracool dwarfs?"):
-            st.session_state.quick_prompt = "How can I use Euclid data to find ultracool dwarf candidates?"
-            st.rerun()
-
-
-def render_tools_mode():
-    """Render the tools interface."""
-    
-    st.header("🔧 Astronomy Tools")
-    st.caption("Query astronomical databases and catalogs directly.")
-    
-    # Tool selection
-    tool = st.selectbox(
-        "Select Tool",
-        ["ADS Search", "arXiv Search", "Gaia Query", "2MASS Query", "WISE Query", "Brown Dwarf Candidates"]
-    )
-    
-    if tool == "ADS Search":
-        st.subheader("🔍 NASA ADS Search")
-        query = st.text_input("Search query", placeholder="e.g., brown dwarf spectroscopy")
-        rows = st.slider("Number of results", 5, 50, 10)
-        
-        if st.button("Search ADS"):
-            with st.spinner("Searching ADS..."):
-                result = execute_tool("search_ads", query=query, rows=rows)
+            render_tool_badges(state.tools_used)
             
-            if result["success"]:
-                for paper in result["data"]:
-                    with st.expander(f"[{paper['year']}] {paper['title'][:80]}... ({paper['citations']} citations)"):
-                        st.write(f"**Authors:** {', '.join(paper['authors'][:5])}")
-                        st.write(f"**Publication:** {paper['publication']}")
-                        st.write(f"**Abstract:** {paper['abstract']}")
-                        st.write(f"**Bibcode:** `{paper['bibcode']}`")
-            else:
-                st.error(result["error"])
-    
-    elif tool == "arXiv Search":
-        st.subheader("📄 arXiv Search")
-        query = st.text_input("Search query", placeholder="e.g., Y dwarf discovery")
-        max_results = st.slider("Number of results", 5, 50, 10)
-        
-        if st.button("Search arXiv"):
-            with st.spinner("Searching arXiv..."):
-                result = execute_tool("search_arxiv", query=query, max_results=max_results)
+            # Show plots
+            for plot_b64 in state.plots:
+                st.image(f"data:image/png;base64,{plot_b64}")
             
-            if result["success"]:
-                for paper in result["data"]:
-                    with st.expander(f"[{paper['published']}] {paper['title'][:80]}..."):
-                        st.write(f"**Authors:** {', '.join(paper['authors'][:5])}")
-                        st.write(f"**arXiv ID:** `{paper['arxiv_id']}`")
-                        st.write(f"**Abstract:** {paper['abstract']}")
-                        if paper.get("pdf_url"):
-                            st.link_button("📥 PDF", paper["pdf_url"])
-            else:
-                st.error(result["error"])
-    
-    elif tool == "Gaia Query":
-        st.subheader("⭐ Gaia DR3 Query")
-        
-        query_type = st.radio("Query type", ["Cone Search", "Custom ADQL"])
-        
-        if query_type == "Cone Search":
-            col1, col2, col3 = st.columns(3)
+            # Show sources and data
+            col1, col2 = st.columns(2)
+            
             with col1:
-                ra = st.number_input("RA (deg)", 0.0, 360.0, 180.0)
+                if state.sources:
+                    with st.expander(f"📚 Sources ({len(set(state.sources))})"):
+                        for src in list(set(state.sources))[:5]:
+                            st.markdown(f"[{src}](https://ui.adsabs.harvard.edu/abs/{src})")
+            
             with col2:
-                dec = st.number_input("Dec (deg)", -90.0, 90.0, 45.0)
-            with col3:
-                radius = st.number_input("Radius (arcmin)", 0.1, 60.0, 5.0)
-            
-            if st.button("Query Gaia"):
-                with st.spinner("Querying Gaia DR3..."):
-                    result = execute_tool("gaia_cone_search", ra=ra, dec=dec, radius_arcmin=radius)
-                
-                if result["success"]:
-                    st.success(f"Found {result['data']['total_rows']} sources")
-                    st.dataframe(result["data"]["rows"])
-                else:
-                    st.error(result["error"])
+                data_items = [(k, v) for k, v in state.data_context.items() 
+                             if isinstance(v, pd.DataFrame)]
+                if data_items:
+                    with st.expander(f"📊 Data ({len(data_items)} tables)"):
+                        for name, df in data_items:
+                            st.markdown(f"**{name}**: {len(df)} rows")
+                            st.dataframe(df.head(5), use_container_width=True)
+                            st.download_button(
+                                f"Download {name}",
+                                df.to_csv(index=False),
+                                f"{name}.csv",
+                                key=f"dl_{name}_new"
+                            )
         
-        else:
-            adql = st.text_area("ADQL Query", height=150, placeholder="""SELECT TOP 100 source_id, ra, dec, parallax, phot_g_mean_mag
-FROM gaiadr3.gaia_source
-WHERE parallax > 10""")
-            
-            if st.button("Execute Query"):
-                with st.spinner("Executing query..."):
-                    result = execute_tool("query_gaia", adql=adql)
-                
-                if result["success"]:
-                    st.success(f"Found {result['data']['total_rows']} rows")
-                    st.dataframe(result["data"]["rows"])
-                else:
-                    st.error(result["error"])
-    
-    elif tool == "Brown Dwarf Candidates":
-        st.subheader("🌡️ Brown Dwarf Candidate Search")
-        st.write("Search Gaia DR3 for brown dwarf candidates based on color and absolute magnitude cuts.")
+        # Save state
+        st.session_state.messages.append({"role": "assistant", "content": response})
+        st.session_state.agent_states.append(state)
         
-        max_distance = st.slider("Maximum distance (pc)", 10, 100, 50)
-        
-        if st.button("Find Brown Dwarf Candidates"):
-            with st.spinner("Searching for candidates..."):
-                result = execute_tool("gaia_brown_dwarf_candidates", max_distance_pc=max_distance)
-            
-            if result["success"]:
-                st.success(f"Found {result['data']['total_rows']} candidates")
-                st.dataframe(result["data"]["rows"])
-                
-                # Plot CMD
-                if result["data"]["rows"]:
-                    import pandas as pd
-                    df = pd.DataFrame(result["data"]["rows"])
-                    
-                    st.subheader("Color-Magnitude Diagram")
-                    st.scatter_chart(df, x="bp_rp", y="abs_g")
-            else:
-                st.error(result["error"])
-    
-    elif tool in ["2MASS Query", "WISE Query"]:
-        catalog = "2mass" if tool == "2MASS Query" else "wise"
-        st.subheader(f"🔭 {tool}")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            ra = st.number_input("RA (deg)", 0.0, 360.0, 180.0)
-        with col2:
-            dec = st.number_input("Dec (deg)", -90.0, 90.0, 45.0)
-        with col3:
-            radius = st.number_input("Radius (arcmin)", 0.1, 60.0, 5.0)
-        
-        if st.button(f"Query {catalog.upper()}"):
-            with st.spinner(f"Querying {catalog.upper()}..."):
-                result = execute_tool(f"query_{catalog}", ra=ra, dec=dec, radius_arcmin=radius)
-            
-            if result["success"]:
-                st.success(f"Found {result['data']['total_rows']} sources")
-                st.dataframe(result["data"]["rows"])
-            else:
-                st.error(result["error"])
-
-
-def render_rag_mode():
-    """Render the RAG search interface for direct document search."""
-    
-    st.header("📚 Document Search")
-    st.caption("Search through 957 astronomy papers and documentation directly.")
-    st.info("💡 RAG is now integrated into Chat! Questions automatically search relevant papers first.")
-    
-    # Search input
-    query = st.text_input("Search documents", placeholder="e.g., T dwarf WISE color selection")
-    
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        top_k = st.selectbox("Results", [5, 10, 20, 50], index=1)
-    with col2:
-        filter_source = st.selectbox("Filter", ["All", "ADS Papers", "Documentation"])
-    
-    if st.button("🔍 Search Documents", type="primary"):
-        if not query:
-            st.warning("Please enter a search query")
-            return
-        
-        with st.spinner("Searching..."):
-            results = rag_search(query, top_k=top_k, filter_source=filter_source)
-        
-        if not results:
-            st.info("No results found.")
-            return
-        
-        st.subheader(f"Found {len(results)} documents")
-        
-        for i, result in enumerate(results):
-            score = result.get("score", 0)
-            text = result.get("text", "")
-            metadata = result.get("metadata", {})
-            source = metadata.get("source", "unknown")
-            
-            with st.expander(f"📄 Result {i+1} (Score: {score:.3f}) - {source}"):
-                if metadata.get("title"):
-                    st.markdown(f"**Title:** {metadata['title']}")
-                if metadata.get("authors"):
-                    st.markdown(f"**Authors:** {metadata['authors']}")
-                if metadata.get("year"):
-                    st.markdown(f"**Year:** {metadata['year']}")
-                if metadata.get("survey"):
-                    st.markdown(f"**Survey:** {metadata['survey']}")
-                st.markdown("---")
-                st.markdown(text)
-
-
-# =============================================================================
-# Main App
-# =============================================================================
-
-def main():
-    """Main application entry point."""
-    
-    # Handle quick prompts
-    if "quick_prompt" in st.session_state:
-        prompt = st.session_state.pop("quick_prompt")
-        st.session_state.messages.append({"role": "user", "content": prompt})
-    
-    # Render sidebar and get mode
-    mode = render_sidebar()
-    
-    # Render main content based on mode
-    if mode == "💬 Chat":
-        render_chat_mode()
-    elif mode == "🔧 Tools":
-        render_tools_mode()
-    elif mode == "📚 RAG Search":
-        render_rag_mode()
-    
-    # Footer
-    st.divider()
-    st.caption("AstroLlama - Fine-tuned Llama 3.3 70B for Substellar Astronomy | Built with ❤️ using AWS Bedrock")
+        st.rerun()
 
 
 if __name__ == "__main__":
