@@ -393,6 +393,9 @@ class AstroTools:
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         
+        # Remove plt.show() as it doesn't work in non-interactive mode
+        code = code.replace('plt.show()', '# plt.show() removed for capture')
+        
         namespace = {}
         setup = """
 import numpy as np
@@ -414,6 +417,9 @@ plt.rcParams['figure.dpi'] = 100
                     namespace[name] = data
                 elif isinstance(data, dict) and 'full_data' in data:
                     namespace[name] = data['full_data']
+                # Also store scalar values (like last_ra, last_dec)
+                elif isinstance(data, (int, float, str)):
+                    namespace[name] = data
         
         stdout_capture = io.StringIO()
         plots = []
@@ -423,6 +429,7 @@ plt.rcParams['figure.dpi'] = 100
             with contextlib.redirect_stdout(stdout_capture):
                 exec(code, namespace)
             
+            # Capture all figures
             for fig_num in plt.get_fignums():
                 fig = plt.figure(fig_num)
                 buf = io.BytesIO()
@@ -753,7 +760,19 @@ def call_astrollama(messages: List[Dict], client, max_retries: int = 5) -> str:
 def run_agent(user_query: str, client, progress_callback=None, max_iterations: int = 4) -> Tuple[str, AgentState]:
     """Run the agent loop with rate limiting protection"""
     state = AgentState()
+    
+    # Load persistent data from previous queries
+    if "persistent_data" in st.session_state:
+        state.data_context.update(st.session_state.persistent_data)
+    
     messages = [{"role": "user", "content": user_query}]
+    
+    # If we have existing data, mention it in context
+    existing_data = list(state.data_context.keys())
+    if existing_data:
+        data_names = [k for k in existing_data if k.endswith('_data')]
+        if data_names:
+            messages[0]["content"] += f"\n\n[Note: Data already available from previous queries: {', '.join(data_names)}]"
     
     for iteration in range(max_iterations):
         if progress_callback:
@@ -772,6 +791,8 @@ def run_agent(user_query: str, client, progress_callback=None, max_iterations: i
         tool_calls = parse_tool_calls(response)
         
         if not tool_calls:
+            # Save data to persistent state before returning
+            st.session_state.persistent_data.update(state.data_context)
             return response, state
         
         tool_results_text = []
@@ -793,7 +814,8 @@ def run_agent(user_query: str, client, progress_callback=None, max_iterations: i
 Based on these results, continue your analysis. 
 - If you need more data, use additional tools.
 - If you have enough information, provide your comprehensive answer WITHOUT tool tags.
-- Remember to reference specific values from the data."""
+- Remember to reference specific values from the data.
+- For plots: ALWAYS use CODE_EXECUTION tool to run the code, don't just show code."""
         })
     
     messages.append({
@@ -801,6 +823,9 @@ Based on these results, continue your analysis.
         "content": "Please provide your final answer now based on all the information gathered."
     })
     final_response = call_astrollama(messages, client)
+    
+    # Save data to persistent state
+    st.session_state.persistent_data.update(state.data_context)
     
     return final_response, state
 
@@ -845,9 +870,16 @@ def render_sidebar():
         
         st.divider()
         
-        if st.button("🗑️ Clear Chat", use_container_width=True):
+        # Show cached data info
+        if "persistent_data" in st.session_state and st.session_state.persistent_data:
+            data_keys = [k for k in st.session_state.persistent_data.keys() if k.endswith('_data')]
+            if data_keys:
+                st.caption(f"📦 Cached: {', '.join(data_keys)}")
+        
+        if st.button("🗑️ Clear Chat & Data", use_container_width=True):
             st.session_state.messages = []
             st.session_state.agent_states = []
+            st.session_state.persistent_data = {}
             st.rerun()
         
         st.divider()
@@ -896,6 +928,8 @@ def main():
         st.session_state.messages = []
     if "agent_states" not in st.session_state:
         st.session_state.agent_states = []
+    if "persistent_data" not in st.session_state:
+        st.session_state.persistent_data = {}  # Persists data across messages
     
     render_sidebar()
     
