@@ -583,7 +583,7 @@ def execute_tool(tool_name: str, params: Dict, state: AgentState) -> str:
         state.tool_results.append({"tool": tool_name, "result": result})
         
         if result.get("data") or result.get("full_data") is not None:
-            catalog_name = params.get('catalog', 'data').lower()
+            catalog_name = params.get('catalog', 'data').lower().replace('2mass', 'twomass')
             if 'full_data' in result:
                 state.data_context[f"{catalog_name}_data"] = result['full_data']
             else:
