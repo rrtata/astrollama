@@ -562,8 +562,8 @@ You can now query catalogs at these coordinates."""
         return f"Unknown tool: {tool_name}"
 
 
-def call_astrollama(messages: List[Dict], client) -> str:
-    """Call AstroLlama model on Bedrock using Llama format"""
+def call_astrollama(messages: List[Dict], client, max_retries: int = 5) -> str:
+    """Call AstroLlama model on Bedrock using Llama format with retry logic"""
     secrets = get_secrets()
     model_id = secrets.get("ASTROLLAMA_MODEL_ID")
     
@@ -588,26 +588,45 @@ def call_astrollama(messages: List[Dict], client) -> str:
         "top_p": 0.9
     }
     
-    try:
-        response = client.invoke_model(
-            modelId=model_id,
-            body=json.dumps(body)
-        )
-        result = json.loads(response["body"].read())
-        return result.get("generation", "")
-    except Exception as e:
-        error_msg = str(e)
-        return f"Error calling AstroLlama model: {error_msg}"
+    # Retry with exponential backoff for throttling
+    for attempt in range(max_retries):
+        try:
+            response = client.invoke_model(
+                modelId=model_id,
+                body=json.dumps(body)
+            )
+            result = json.loads(response["body"].read())
+            return result.get("generation", "")
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Check if it's a throttling error
+            if "ThrottlingException" in error_msg or "Too many requests" in error_msg:
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 2, 4, 8, 16, 32 seconds
+                    wait_time = 2 ** (attempt + 1)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return f"Error: Model rate limited. Please wait a minute and try again."
+            else:
+                return f"Error calling AstroLlama model: {error_msg}"
+    
+    return "Error: Failed after multiple retries"
 
 
-def run_agent(user_query: str, client, progress_callback=None, max_iterations: int = 6) -> Tuple[str, AgentState]:
-    """Run the agent loop"""
+def run_agent(user_query: str, client, progress_callback=None, max_iterations: int = 4) -> Tuple[str, AgentState]:
+    """Run the agent loop with rate limiting protection"""
     state = AgentState()
     messages = [{"role": "user", "content": user_query}]
     
     for iteration in range(max_iterations):
         if progress_callback:
             progress_callback(f"Step {iteration + 1}: Analyzing...")
+        
+        # Add small delay between iterations to avoid rate limiting
+        if iteration > 0:
+            time.sleep(2)
         
         response = call_astrollama(messages, client)
         
