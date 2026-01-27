@@ -297,6 +297,26 @@ class AstroTools:
                         pass
             
             if ra is None or dec is None:
+                # Try to parse J-coordinates from survey names (CWISE, 2MASS, WISE, SDSS, etc.)
+                # Format: CWISE J0506+0738 means RA=05h06m, Dec=+07°38'
+                j_pattern = r'J(\d{2})(\d{2})(\d{0,2}\.?\d*)([+-])(\d{2})(\d{2})(\d{0,2}\.?\d*)?'
+                j_match = re.search(j_pattern, name.replace(' ', ''))
+                
+                if j_match:
+                    ra_h = int(j_match.group(1))
+                    ra_m = int(j_match.group(2))
+                    ra_s = float(j_match.group(3)) if j_match.group(3) else 0
+                    dec_sign = 1 if j_match.group(4) == '+' else -1
+                    dec_d = int(j_match.group(5))
+                    dec_m = int(j_match.group(6))
+                    dec_s = float(j_match.group(7)) if j_match.group(7) else 0
+                    
+                    # Convert to decimal degrees
+                    ra = (ra_h + ra_m/60 + ra_s/3600) * 15  # hours to degrees
+                    dec = dec_sign * (dec_d + dec_m/60 + dec_s/3600)
+                    resolved_name = f"{name} (parsed from J-coordinates)"
+            
+            if ra is None or dec is None:
                 # Last resort: provide known coordinates for common objects
                 known_coords = {
                     "pleiades": (56.75, 24.12),
@@ -467,6 +487,12 @@ Works with: Star names, M/NGC numbers, cluster names (Pleiades, Hyades), coordin
 Format: TOOL:OBJECT_LOOKUP|name=Pleiades
 Format: TOOL:OBJECT_LOOKUP|name=M45
 Format: TOOL:OBJECT_LOOKUP|name=56.75 24.12
+
+**IMPORTANT - If OBJECT_LOOKUP fails:**
+- For CWISE/WISE names like "CWISE J0506+0738", parse coordinates from name: J0506+0738 means RA=05h06m (76.5°), Dec=+07°38' (7.63°)
+- For 2MASS names like "2MASS J05062738+0738", parse similarly
+- Then use CATALOG_QUERY directly with those coordinates
+- NEVER give up just because lookup failed - extract coordinates from the name!
 
 ### 3. LITERATURE_SEARCH - Search NASA ADS for papers
 Use for research questions or to cite sources.
