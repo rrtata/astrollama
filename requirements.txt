@@ -1,7 +1,22 @@
+# Core
 streamlit>=1.30.0
 boto3>=1.34.0
 pandas>=2.0.0
 numpy>=1.24.0
-pinecone>=3.0.0
+
+# Plotting - REQUIRED for code execution
+matplotlib>=3.7.0
+
+# Astronomy
+astropy>=6.0.0
+astroquery>=0.4.6
+
+# RAG
+pinecone-client>=3.0.0
 sentence-transformers>=2.2.0
+
+# HTTP requests
 requests>=2.31.0
+
+# Optional but useful
+scipy>=1.11.0
