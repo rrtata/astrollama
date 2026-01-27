@@ -726,8 +726,8 @@ def call_astrollama(messages: List[Dict], client, max_retries: int = 5) -> str:
     use_claude = st.session_state.get("model_choice", "AstroLlama (Fine-tuned)") == "Claude 4.5 Sonnet"
     
     if use_claude:
-        # Use Claude 4.5 Sonnet
-        model_id = "anthropic.claude-sonnet-4-20250514"
+        # Use Claude 4.5 Sonnet with regional prefix for Bedrock
+        model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
         
         # Build messages for Claude format
         claude_messages = []
@@ -908,7 +908,7 @@ def render_sidebar():
             "Select model",
             ["AstroLlama (Fine-tuned)", "Claude 4.5 Sonnet"],
             key="model_choice",
-            help="AstroLlama is fine-tuned for astronomy. Claude 4.5 is a general-purpose model."
+            help="AstroLlama is fine-tuned for astronomy. Claude 4.5 Sonnet is Anthropic's latest model."
         )
         
         st.divider()
