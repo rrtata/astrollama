@@ -495,8 +495,19 @@ Format: TOOL:OBJECT_LOOKUP|name=56.75 24.12
 - NEVER give up just because lookup failed - extract coordinates from the name!
 
 ### 3. LITERATURE_SEARCH - Search NASA ADS for papers
-Use for research questions or to cite sources.
-Format: TOOL:LITERATURE_SEARCH|query=brown dwarf atmospheres|max_results=5
+Use for finding papers, citations, author searches, or research questions.
+Format: TOOL:LITERATURE_SEARCH|query=<search query>|max_results=10
+
+**EXAMPLES - Copy these patterns exactly:**
+- Find papers by author: TOOL:LITERATURE_SEARCH|query=author:"Tata, R." year:2025|max_results=10
+- Find papers on topic: TOOL:LITERATURE_SEARCH|query=brown dwarf atmospheres|max_results=10
+- Find recent papers: TOOL:LITERATURE_SEARCH|query=T dwarf discovery year:2024-2025|max_results=10
+- Find papers about object: TOOL:LITERATURE_SEARCH|query="TRAPPIST-1"|max_results=10
+
+**IMPORTANT:** 
+- For author searches, use author:"LastName, F." format
+- Always use this tool when user asks about papers, publications, or research
+- Search first, then summarize results
 
 ### 4. RAG_QUERY - Search knowledge base
 Use for background information on concepts/methods.
@@ -528,6 +539,19 @@ TOOL:CODE_EXECUTION|code=import matplotlib.pyplot as plt; w1w2 = allwise_data['W
 9. **USE LATEST DATA** - Data from CATALOG_QUERY is available as: gaia_data, twomass_data, allwise_data, catwise_data, simbad_data.
 10. **DONT USE SAMPLE DATA** - Never create sample/fake data. Use real data from catalog queries.
 11. **CODE ON SINGLE LINE** - Put all code on one line with semicolons. Do NOT use newlines in code.
+12. **PAPERS/PUBLICATIONS → LITERATURE_SEARCH** - When user asks about papers, authors, publications, or "show me papers", ALWAYS use LITERATURE_SEARCH tool first. Never say "I don't have access" - you DO have access via the tool!
+13. **USE TOOLS IMMEDIATELY** - Don't explain what you will do. Just call the tool. Start your response with TOOL: when a tool is needed.
+
+## QUERY TYPE → TOOL MAPPING (ALWAYS FOLLOW THIS)
+
+| User asks about... | YOU MUST USE |
+|-------------------|--------------|
+| Papers, publications, citations | TOOL:LITERATURE_SEARCH |
+| Author's papers | TOOL:LITERATURE_SEARCH|query=author:"Name"|max_results=10 |
+| Object coordinates | TOOL:OBJECT_LOOKUP |
+| Catalog data, photometry | TOOL:CATALOG_QUERY |
+| Plot, diagram, visualization | TOOL:CODE_EXECUTION |
+| How to identify/classify | TOOL:RAG_QUERY |
 
 ## CODE EXAMPLES FOR COMMON TASKS
 
