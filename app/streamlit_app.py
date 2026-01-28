@@ -769,13 +769,63 @@ You can now query catalogs at these coordinates."""
 
 
 def call_astrollama(messages: List[Dict], client, max_retries: int = 5) -> str:
-    """Call AstroLlama or Claude model on Bedrock with retry logic"""
+    """Call Ollama, AstroLlama, or Claude model with retry logic"""
     secrets = get_secrets()
     
     # Check which model is selected
-    use_claude = st.session_state.get("model_choice", "AstroLlama (Fine-tuned)") == "Claude 4.5 Sonnet"
+    model_choice = st.session_state.get("model_choice", "🏠 Local Llama 3.3 70B (Ollama)")
     
-    if use_claude:
+    # ========== OLLAMA (LOCAL/REMOTE) ==========
+    if "Local Llama" in model_choice:
+        # Priority: 1) secrets OLLAMA_URL, 2) session state, 3) localhost default
+        ollama_url = secrets.get("OLLAMA_URL") or st.session_state.get("ollama_url", "http://localhost:11434")
+        
+        # Build messages for Ollama (OpenAI-compatible format)
+        ollama_messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
+        for msg in messages:
+            ollama_messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+        
+        body = {
+            "model": "llama3.3:70b",
+            "messages": ollama_messages,
+            "stream": False,
+            "options": {
+                "temperature": 0.7,
+                "num_predict": 2048
+            }
+        }
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    f"{ollama_url}/api/chat",
+                    json=body,
+                    timeout=180  # Increased timeout for large model
+                )
+                if response.status_code == 200:
+                    result = response.json()
+                    return result.get("message", {}).get("content", "")
+                elif response.status_code == 404:
+                    return f"Error: Model 'llama3.3:70b' not found. Run 'ollama pull llama3.3:70b' on your server."
+                else:
+                    return f"Error: Ollama returned status {response.status_code}: {response.text}"
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                return "Error: Ollama request timed out. The model may still be loading."
+            except requests.exceptions.ConnectionError:
+                return "Error: Cannot connect to Ollama. Make sure it's running with 'ollama serve'"
+            except Exception as e:
+                return f"Error calling Ollama: {str(e)}"
+        
+        return "Error: Failed after multiple retries"
+    
+    # ========== CLAUDE 4.5 SONNET ==========
+    elif "Claude" in model_choice:
         # Use Claude 4.5 Sonnet with regional prefix for Bedrock
         model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
         
@@ -817,6 +867,8 @@ def call_astrollama(messages: List[Dict], client, max_retries: int = 5) -> str:
                         return f"Error: Model rate limited. Please wait a minute and try again."
                 else:
                     return f"Error calling Claude model: {error_msg}"
+    
+    # ========== ASTROLLAMA (BEDROCK FINE-TUNED) ==========
     else:
         # Use AstroLlama (fine-tuned Llama)
         model_id = secrets.get("ASTROLLAMA_MODEL_ID")
@@ -952,26 +1004,34 @@ def render_sidebar():
         
         st.divider()
         
-        # Model selector
+        # Model selector - Ollama is primary/first
         st.markdown("### 🤖 Model")
         model_choice = st.selectbox(
             "Select model",
-            ["AstroLlama (Fine-tuned)", "Claude 4.5 Sonnet"],
+            ["🏠 Local Llama 3.3 70B (Ollama)", "🦙 AstroLlama (Fine-tuned)", "🟣 Claude 4.5 Sonnet"],
             key="model_choice",
-            help="AstroLlama is fine-tuned for astronomy. Claude 4.5 Sonnet is Anthropic's latest model."
+            help="Local Ollama is fastest and free. AstroLlama is fine-tuned for astronomy. Claude 4.5 requires AWS access."
         )
+        
+        # Ollama URL config - use secrets if available
+        secrets = get_secrets()
+        default_ollama_url = secrets.get("OLLAMA_URL", "http://localhost:11434")
+        if "Local Llama" in model_choice:
+            ollama_url = st.text_input("Ollama URL", value=default_ollama_url, key="ollama_url", 
+                                       help="Set via OLLAMA_URL in secrets for remote access")
         
         st.divider()
         
         st.markdown("### System Status")
-        secrets = get_secrets()
         
         # Show active model
-        active_model = st.session_state.get("model_choice", "AstroLlama (Fine-tuned)")
-        if active_model == "Claude 4.5 Sonnet":
+        active_model = st.session_state.get("model_choice", "🏠 Local Llama 3.3 70B (Ollama)")
+        if "Claude" in active_model:
             st.markdown("🟣 **Active: Claude 4.5 Sonnet**")
+        elif "AstroLlama" in active_model:
+            st.markdown("🦙 **Active: AstroLlama (Bedrock)**")
         else:
-            st.markdown("🦙 **Active: AstroLlama**")
+            st.markdown("🏠 **Active: Local Llama 3.3 70B**")
         
         statuses = [
             ("AWS Bedrock", bool(secrets.get("AWS_ACCESS_KEY_ID"))),
@@ -979,6 +1039,17 @@ def render_sidebar():
             ("RAG Knowledge Base", bool(secrets.get("PINECONE_API_KEY"))),
             ("NASA ADS", bool(secrets.get("ADS_TOKEN")))
         ]
+        
+        # Check Ollama status
+        try:
+            import requests
+            ollama_check_url = secrets.get("OLLAMA_URL") or st.session_state.get("ollama_url", "http://localhost:11434")
+            r = requests.get(f"{ollama_check_url}/api/tags", timeout=3)
+            ollama_ok = r.status_code == 200
+        except:
+            ollama_ok = False
+        
+        statuses.insert(0, ("Local Ollama", ollama_ok))
         
         for name, status in statuses:
             icon = "✅" if status else "❌"
